@@ -16,6 +16,7 @@ set -euo pipefail
 
 KHUB_VERSION="0.1.0"
 ORG="blueblazedev"
+KHUB_REPO="${ORG}/khub"   # where the CLI itself lives (for self-upgrade)
 CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"
 HUB_DIRNAME="knowledge-hub"
 BOT_SUBJECT_PREFIX="publish: snapshot"
@@ -245,6 +246,24 @@ cmd_doctor() {
   if [ "$fails" -eq 0 ]; then say "${c_grn}all checks passed${c_reset}"; else say "${c_red}${fails} check(s) failed${c_reset} — see fixes above"; return 1; fi
 }
 
+cmd_upgrade() {
+  # Self-update the CLI to the latest published release. SEPARATE from `khub
+  # update` (which refreshes your hub CONTENT clone). Fetches install.sh from the
+  # latest release (a pinned asset, never a mutable branch) and runs it against
+  # the directory the current `khub` lives in.
+  command -v curl >/dev/null 2>&1 || die "curl is required to upgrade" "install curl, then re-run"
+  local self bindir tag
+  self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"
+  bindir="$(dirname "$self")"
+  tag="$(curl -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$tag" ] || die "could not resolve the latest khub release" "check your network"
+  say "Upgrading khub (${KHUB_VERSION} → ${tag}) in ${bindir}…"
+  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/install.sh" \
+    | KHUB_INSTALL_VERSION="$tag" KHUB_BIN_DIR="$bindir" bash \
+    || die "upgrade failed" "re-run the install one-liner from the ${KHUB_REPO} README"
+}
+
 usage() {
   cat <<EOF
 khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
@@ -252,11 +271,14 @@ khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
 usage:
   khub init [dir]        clone the hub as a sibling under dir (default: current dir)
   khub update [--path D] [--reset]
-                         fast-forward the hub clone to the latest snapshot
-                         --reset discards local changes (confirms first)
+                         update your hub CONTENT clone to the latest snapshot
+                         (--reset discards local changes, confirms first)
+  khub upgrade           update the khub CLI itself to the latest release
   khub doctor [--path D] diagnose auth, access, sibling layout, and freshness
   khub version [--path D] print the CLI version and the clone's latest snapshot
   khub help              this message
+
+Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.
 
 The hub clone is pull-only. Your work lives in your own code repos, which point
 back at ../${HUB_DIRNAME}. Access is granted by the owner; removal stops future
@@ -270,6 +292,7 @@ main() {
   case "$cmd" in
     init)            cmd_init "$@" ;;
     update)          cmd_update "$@" ;;
+    upgrade|self-update) cmd_upgrade "$@" ;;
     doctor)          cmd_doctor "$@" ;;
     version|--version|-v) cmd_version "$@" ;;
     help|--help|-h)  usage ;;
