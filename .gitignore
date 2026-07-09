@@ -1,0 +1,3 @@
+# nothing to build — the CLI is a single tracked script.
+.DS_Store
+*.log

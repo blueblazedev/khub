@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# =============================================================================
+# khub — clone and keep a delivered knowledge-hub snapshot current, as a sibling
+# of your code repos. Interface only: it talks to the private client repo using
+# YOUR existing `gh` auth. Dependencies: git + gh (nothing else).
+#
+#   khub init [dir]   clone the hub as a sibling under dir (default: cwd)
+#   khub update       fast-forward the hub clone to the latest snapshot
+#   khub doctor       diagnose the setup (auth, access, sibling layout, freshness)
+#   khub version      print the CLI version + the clone's latest snapshot
+#
+# The hub clone is PULL-ONLY: your work lives in your own code repos, which point
+# back at ../knowledge-hub for context. Never commit into the clone.
+# =============================================================================
+
+KHUB_VERSION="0.1.0"
+ORG="blueblazedev"
+CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"
+HUB_DIRNAME="knowledge-hub"
+BOT_SUBJECT_PREFIX="publish: snapshot"
+BOT_AUTHOR="knowledge-hub-bot"
+STALE_DAYS="${KHUB_STALE_DAYS:-30}"
+
+# ---- output helpers ---------------------------------------------------------
+c_reset=''; c_red=''; c_grn=''; c_ylw=''
+if [ -t 1 ]; then c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %sPASS%s  %s\n' "$c_grn" "$c_reset" "$*"; }
+warn() { printf '  %sWARN%s  %s\n' "$c_ylw" "$c_reset" "$*"; }
+bad()  { printf '  %sFAIL%s  %s\n' "$c_red" "$c_reset" "$*"; }
+# die "message" ["one-line fix hint"]
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_reset" "$1" >&2; [ $# -ge 2 ] && printf '  fix: %s\n' "$2" >&2; exit 1; }
+
+# ---- individual checks (reused by doctor AND init preflight) -----------------
+have_git()   { command -v git >/dev/null 2>&1; }
+have_gh()    { command -v gh  >/dev/null 2>&1; }
+gh_authed()  { gh auth status >/dev/null 2>&1; }
+api_access() { gh repo view "$CLIENT_REPO" >/dev/null 2>&1; }
+# API access (a REST read) does NOT prove clone access — the git transport uses a
+# separate credential path. Probe it directly with the gh-provided git creds.
+git_transport_access() {
+  local url; url="$(gh_clone_url)"
+  GIT_TERMINAL_PROMPT=0 git ls-remote "$url" >/dev/null 2>&1
+}
+gh_clone_url() {
+  # honour gh's configured protocol; default to https which gh can credential.
+  printf 'https://github.com/%s.git' "$CLIENT_REPO"
+}
+
+# ---- hub-clone location + snapshot inspection -------------------------------
+# Find the knowledge-hub clone: explicit --path, else cwd, else a sibling, else
+# parent (when run from inside a code repo that sits beside the hub).
+find_hub_dir() {
+  local p="$1"
+  if [ -n "$p" ]; then [ -d "$p" ] && printf '%s' "$p" && return 0 || return 1; fi
+  if [ -f "./AGENTS.md" ] && [ -d "./.knowledge" ]; then printf '%s' "." && return 0; fi
+  if [ -d "./$HUB_DIRNAME/.knowledge" ]; then printf '%s' "./$HUB_DIRNAME" && return 0; fi
+  if [ -d "../$HUB_DIRNAME/.knowledge" ]; then printf '%s' "../$HUB_DIRNAME" && return 0; fi
+  return 1
+}
+is_git_repo()      { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
+latest_subject()   { git -C "$1" log -1 --pretty=%s 2>/dev/null; }
+latest_author()    { git -C "$1" log -1 --pretty=%an 2>/dev/null; }
+latest_short_sha() { git -C "$1" log -1 --pretty=%h 2>/dev/null; }
+latest_iso_date()  { git -C "$1" log -1 --pretty=%cI 2>/dev/null; }
+# A genuine snapshot is a bot commit BY SUBJECT AND AUTHOR — subject alone is
+# visible in the client's own log and trivially spoofable by anyone who can write.
+is_bot_snapshot() {
+  case "$(latest_subject "$1")" in "$BOT_SUBJECT_PREFIX"*) ;; *) return 1;; esac
+  [ "$(latest_author "$1")" = "$BOT_AUTHOR" ]
+}
+# whole-day age of the latest commit; empty if undeterminable. Use git's own
+# committer epoch (%ct) — no date-string parsing (BSD vs GNU `date` disagree on
+# tz offsets, which silently broke this on macOS).
+snapshot_age_days() {
+  local ct now; ct="$(git -C "$1" log -1 --pretty=%ct 2>/dev/null)"; [ -n "$ct" ] || return 1
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ct) / 86400 ))"
+}
+has_local_commits() {  # commits on HEAD not on the upstream = someone wrote to the clone
+  git -C "$1" rev-parse '@{u}' >/dev/null 2>&1 || return 1
+  [ -n "$(git -C "$1" rev-list '@{u}..HEAD' 2>/dev/null)" ]
+}
+
+# ---- verbs ------------------------------------------------------------------
+cmd_version() {
+  say "khub ${KHUB_VERSION}"
+  local hub; if hub="$(find_hub_dir "${1:-}")" && is_git_repo "$hub"; then
+    say "hub clone: $hub"
+    if is_bot_snapshot "$hub"; then
+      say "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
+    else
+      say "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
+    fi
+  else
+    say "hub clone: not found (run 'khub init')"
+  fi
+}
+
+preflight() {
+  have_git || die "git is not installed" "install git, then re-run"
+  have_gh  || die "the GitHub CLI 'gh' is not installed" "https://cli.github.com then 'gh auth login'"
+  gh_authed || die "not logged in to GitHub" "run 'gh auth login'"
+  api_access || die "no access to ${CLIENT_REPO}" "ask the owner to add you as a collaborator, then re-run"
+  git_transport_access || die "gh is authed but git cannot clone ${CLIENT_REPO}" "run 'gh auth setup-git' to wire git to your gh credentials"
+}
+
+cmd_init() {
+  local dir="${1:-.}"
+  [ -d "$dir" ] || die "target directory does not exist: $dir"
+  local target="${dir%/}/${HUB_DIRNAME}"
+  if [ -e "$target" ]; then
+    if is_git_repo "$target"; then
+      die "a hub clone already exists at $target" "run 'khub update' to refresh it"
+    else
+      die "path already exists and is not a hub clone: $target"
+    fi
+  fi
+  say "Preflight…"; preflight; say "  ok — git, gh auth, API + clone access all good"
+  say "Cloning ${CLIENT_REPO} -> ${target}"
+  gh repo clone "$CLIENT_REPO" "$target" >/dev/null 2>&1 || die "clone failed" "re-run 'khub doctor' to diagnose"
+  say ""
+  say "Done. The hub is at ${target} (pull-only — keep it current with 'khub update')."
+  say "Next steps:"
+  say "  • Point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
+  say "  • Read the entry point:          ${target}/AGENTS.md"
+  say "  • Health check any time:         khub doctor"
+}
+
+cmd_update() {
+  local path="" reset=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path) path="${2:-}"; shift 2 ;;
+      --reset) reset=1; shift ;;
+      *) die "unknown option for update: $1" "see 'khub help'";;
+    esac
+  done
+  local hub; hub="$(find_hub_dir "$path")" || die "no ${HUB_DIRNAME}/ clone found" "run 'khub init' first, or pass --path DIR"
+  is_git_repo "$hub" || die "$hub is not a git clone" "re-clone with 'khub init'"
+  say "Updating hub at $hub…"
+  git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
+
+  if [ "$reset" = "1" ]; then
+    printf 'This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$hub"
+    read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
+    git -C "$hub" reset --hard '@{u}' --quiet && git -C "$hub" clean -fd >/dev/null 2>&1
+    say "reset to the latest snapshot."
+  elif git -C "$hub" merge-base --is-ancestor HEAD '@{u}' 2>/dev/null; then
+    git -C "$hub" merge --ff-only --quiet '@{u}' || die "fast-forward failed unexpectedly" "run 'khub doctor'"
+  else
+    # Cannot fast-forward. Counting divergent commits cannot tell "I wrote to the
+    # clone" apart from "upstream was rewritten" — after a leak-incident force-push
+    # the orphaned bot snapshots ARE divergent commits. The AUTHOR is the tell:
+    # any non-bot commit = genuine local work; all-bot divergence = upstream rewrite.
+    local nonbot
+    nonbot="$(git -C "$hub" log '@{u}..HEAD' --format='%an' 2>/dev/null | grep -vcx "$BOT_AUTHOR" || true)"
+    if [ "${nonbot:-0}" -gt 0 ]; then
+      die "this clone has local commits — it is pull-only" \
+        "move your work into your own code repos, then 'khub update --reset' (discards local changes, confirms first)"
+    else
+      die "upstream history was rewritten (non-fast-forward)" \
+        "leak-incident re-clone path: delete '$hub' and 'khub init' again — do NOT --reset (that keeps the purged content in local git objects)"
+    fi
+  fi
+
+  # post-update sanity: is this a genuine, fresh, untampered snapshot?
+  [ -f "$hub/AGENTS.md" ] && [ -f "$hub/.knowledge/README.md" ] || warn "expected hub files missing — the clone may be corrupt (re-init)"
+  if is_bot_snapshot "$hub"; then
+    say "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+  else
+    warn "latest commit is not a published snapshot (subject: '$(latest_subject "$hub")') — possible tampering"
+  fi
+  local age; if age="$(snapshot_age_days "$hub")" && [ "$age" -gt "$STALE_DAYS" ]; then
+    warn "snapshot is ${age} days old (> ${STALE_DAYS}) — the publisher may be stuck; ask the owner"
+  fi
+}
+
+cmd_doctor() {
+  local path=""
+  case "${1:-}" in --path) path="${2:-}";; esac
+  say "khub doctor — ${CLIENT_REPO}"
+  local fails=0
+  if have_git; then ok "git installed"; else bad "git not installed — install git"; fails=$((fails+1)); fi
+  if have_gh; then ok "gh installed"; else bad "gh not installed — https://cli.github.com"; fails=$((fails+1)); fi
+  if have_gh && gh_authed; then ok "gh authenticated"; else bad "gh not authenticated — run 'gh auth login'"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && api_access; then ok "API access to ${CLIENT_REPO}"; else bad "no access to ${CLIENT_REPO} — ask the owner to add you as a collaborator"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && git_transport_access; then ok "git clone access (transport)"; else bad "git cannot clone — run 'gh auth setup-git'"; fails=$((fails+1)); fi
+
+  local hub
+  if hub="$(find_hub_dir "$path")"; then
+    ok "hub clone found at $hub"
+    if is_git_repo "$hub"; then
+      if is_bot_snapshot "$hub"; then ok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else bad "latest commit is NOT a published snapshot — possible tampering (re-init)"; fails=$((fails+1)); fi
+      if has_local_commits "$hub"; then bad "clone has local commits — it is pull-only; move work to your own repos"; fails=$((fails+1)); else ok "clone is fast-forward-clean (no local commits)"; fi
+      local age; if age="$(snapshot_age_days "$hub")"; then
+        if [ "$age" -gt "$STALE_DAYS" ]; then warn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else ok "snapshot is fresh (${age}d old)"; fi
+      fi
+    else
+      bad "$hub exists but is not a git clone — re-init"; fails=$((fails+1))
+    fi
+  else
+    # The BOOTSTRAP #1 footgun: a code repo whose CLAUDE.md points at a hub that
+    # is not checked out beside it.
+    if [ -f "./CLAUDE.md" ] && grep -q "knowledge-hub" ./CLAUDE.md 2>/dev/null; then
+      bad "this repo points at ../${HUB_DIRNAME} but no hub clone is beside it — run: khub init .."
+    else
+      bad "no ${HUB_DIRNAME}/ clone found — run 'khub init'"
+    fi
+    fails=$((fails+1))
+  fi
+
+  say ""
+  if [ "$fails" -eq 0 ]; then say "${c_grn}all checks passed${c_reset}"; else say "${c_red}${fails} check(s) failed${c_reset} — see fixes above"; return 1; fi
+}
+
+usage() {
+  cat <<EOF
+khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
+
+usage:
+  khub init [dir]        clone the hub as a sibling under dir (default: current dir)
+  khub update [--path D] [--reset]
+                         fast-forward the hub clone to the latest snapshot
+                         --reset discards local changes (confirms first)
+  khub doctor [--path D] diagnose auth, access, sibling layout, and freshness
+  khub version [--path D] print the CLI version and the clone's latest snapshot
+  khub help              this message
+
+The hub clone is pull-only. Your work lives in your own code repos, which point
+back at ../${HUB_DIRNAME}. Access is granted by the owner; removal stops future
+pulls but the history already on your machine remains.
+EOF
+}
+
+# ---- dispatch ---------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"; [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    init)            cmd_init "$@" ;;
+    update)          cmd_update "$@" ;;
+    doctor)          cmd_doctor "$@" ;;
+    version|--version|-v) cmd_version "$@" ;;
+    help|--help|-h)  usage ;;
+    *)               printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
+  esac
+}
+main "$@"

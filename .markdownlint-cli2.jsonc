@@ -1,0 +1,11 @@
+{
+  // House style, mirrored from the knowledge-hub so both repos read the same.
+  "config": {
+    "MD013": { "line_length": 120, "code_blocks": false, "tables": false },
+    "MD024": { "siblings_only": true },
+    "MD033": false,   // inline HTML ok
+    "MD041": false,   // first line need not be H1
+    "MD040": false    // fenced blocks need not specify a language
+  },
+  "globs": ["**/*.md", "!**/node_modules/**"]
+}
