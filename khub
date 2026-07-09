@@ -166,7 +166,9 @@ cmd_update() {
   fi
 
   # post-update sanity: is this a genuine, fresh, untampered snapshot?
-  [ -f "$hub/AGENTS.md" ] && [ -f "$hub/.knowledge/README.md" ] || warn "expected hub files missing — the clone may be corrupt (re-init)"
+  if [ ! -f "$hub/AGENTS.md" ] || [ ! -f "$hub/.knowledge/README.md" ]; then
+    warn "expected hub files missing — the clone may be corrupt (re-init)"
+  fi
   if is_bot_snapshot "$hub"; then
     say "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
   else
