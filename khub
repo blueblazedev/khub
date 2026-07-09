@@ -6,15 +6,16 @@ set -euo pipefail
 # YOUR existing `gh` auth. Dependencies: git + gh (nothing else).
 #
 #   khub init [dir]   clone the hub as a sibling under dir (default: cwd)
-#   khub update       fast-forward the hub clone to the latest snapshot
-#   khub doctor       diagnose the setup (auth, access, sibling layout, freshness)
+#   khub update       fast-forward the hub clone (--dry-run previews; --reset)
+#   khub upgrade      update the khub CLI itself (--check only reports)
+#   khub doctor       diagnose the setup (--report emits a redacted diagnostic)
 #   khub version      print the CLI version + the clone's latest snapshot
 #
 # The hub clone is PULL-ONLY: your work lives in your own code repos, which point
 # back at ../knowledge-hub for context. Never commit into the clone.
 # =============================================================================
 
-KHUB_VERSION="0.1.2"
+KHUB_VERSION="0.2.0"
 ORG="blueblazedev"
 KHUB_REPO="${ORG}/khub"   # where the CLI itself lives (for self-upgrade)
 CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"
@@ -23,15 +24,53 @@ BOT_SUBJECT_PREFIX="publish: snapshot"
 BOT_AUTHOR="knowledge-hub-bot"
 STALE_DAYS="${KHUB_STALE_DAYS:-30}"
 
-# ---- output helpers ---------------------------------------------------------
-c_reset=''; c_red=''; c_grn=''; c_ylw=''
-if [ -t 1 ]; then c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; fi
-say()  { printf '%s\n' "$*"; }
-ok()   { printf '  %sPASS%s  %s\n' "$c_grn" "$c_reset" "$*"; }
-warn() { printf '  %sWARN%s  %s\n' "$c_ylw" "$c_reset" "$*"; }
-bad()  { printf '  %sFAIL%s  %s\n' "$c_red" "$c_reset" "$*"; }
-# die "message" ["one-line fix hint"]
-die()  { printf '%serror:%s %s\n' "$c_red" "$c_reset" "$1" >&2; [ $# -ge 2 ] && printf '  fix: %s\n' "$2" >&2; exit 1; }
+# ---- terminal style ---------------------------------------------------------
+# 16-color + bold/dim only, and ONLY on an interactive TTY with NO_COLOR unset
+# (piped/redirected/NO_COLOR runs therefore emit zero ANSI bytes).
+c_reset=''; c_red=''; c_grn=''; c_ylw=''; c_blu=''; c_cyan=''; c_bold=''; c_dim=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+  c_blu=$'\033[34m'; c_cyan=$'\033[36m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+fi
+# Glyphs: Unicode when the locale is UTF-8, else fixed-width ASCII so columns
+# stay aligned. POSIX precedence: LC_ALL, then LC_CTYPE, then LANG.
+_loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$_loc" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*)
+    g_ok='✓'; g_warn='⚠'; g_bad='✗'; g_info='ℹ'; g_arrow='→'; g_pipe='│' ;;
+  *)
+    g_ok='OK'; g_warn='!!'; g_bad='XX'; g_info='i '; g_arrow='->'; g_pipe='|' ;;
+esac
+
+say()    { printf '%s\n' "$*"; }
+# cyan '>' marker + bold title
+title()  { printf '%s%s>%s %s%s%s\n' "$c_cyan" "$c_bold" "$c_reset" "$c_bold" "$*" "$c_reset"; }
+# check rows: colored glyph carries the status; the message stays plain
+ok()     { printf '  %s%s%s %s\n' "$c_grn" "$g_ok"   "$c_reset" "$*"; }
+warn()   { printf '  %s%s%s %s\n' "$c_ylw" "$g_warn" "$c_reset" "$*"; }
+bad()    { printf '  %s%s%s %s\n' "$c_red" "$g_bad"  "$c_reset" "$*"; }
+info()   { printf '  %s%s%s %s\n' "$c_blu" "$g_info" "$c_reset" "$*"; }
+# dim '→' fix-hint continuation and dim detail line
+hint()   { printf '  %s%s %s%s\n' "$c_dim" "$g_arrow" "$*" "$c_reset"; }
+detail() { printf '  %s%s%s\n' "$c_dim" "$*" "$c_reset"; }
+# doctor-only frame: a dim │ guide down the left, bold-cyan section headers
+frame_section() { printf '%s%s%s %s%s%s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_bold$c_cyan" "$*" "$c_reset"; }
+fok()    { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_grn" "$g_ok"   "$c_reset" "$*"; }
+fwarn()  { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_ylw" "$g_warn" "$c_reset" "$*"; }
+fbad()   { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_red" "$g_bad"  "$c_reset" "$*"; }
+fhint()  { printf '%s%s%s   %s%s %s%s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_dim" "$g_arrow" "$*" "$c_reset"; }
+# die keeps a red 'error:'; the fix hint becomes a dim '→'
+die()    {
+  printf '%serror:%s %s\n' "$c_red" "$c_reset" "$1" >&2
+  if [ $# -ge 2 ]; then printf '  %s%s %s%s\n' "$c_dim" "$g_arrow" "$2" "$c_reset" >&2; fi
+  exit 1
+}
+# Display a path with $HOME collapsed to ~ and a long middle elided.
+tilde() {
+  local p="$1"
+  case "$p" in "$HOME"*) p="~${p#"$HOME"}" ;; esac
+  if [ "${#p}" -gt 48 ]; then printf '%s…%s' "${p:0:24}" "${p: -21}"; else printf '%s' "$p"; fi
+}
 
 # ---- individual checks (reused by doctor AND init preflight) -----------------
 have_git()   { command -v git >/dev/null 2>&1; }
@@ -89,21 +128,148 @@ has_local_commits() {  # commits on HEAD not on the upstream = someone wrote to 
   [ -n "$(git -C "$1" rev-list '@{u}..HEAD' 2>/dev/null)" ]
 }
 
+# ---- sha256 (portable) ------------------------------------------------------
+# Compute a file's sha256 with whichever tool exists (both preinstalled on
+# macOS/Linux). String-compared later — avoids `-c` flag divergence.
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else return 1; fi
+}
+
+# ---- upgrade-nudge cache ----------------------------------------------------
+# Cache the latest-release probe so version/doctor can mention a newer CLI
+# without a network round-trip each time. Positive entries live 7d; a failed
+# probe writes a negative stamp that lives 1d, so offline/proxied users retry at
+# most once a day instead of stalling 2s on every command.
+NUDGE_TTL_OK=604800
+NUDGE_TTL_NEG=86400
+cache_dir()  { printf '%s/khub' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+cache_file() { printf '%s/khub/latest-release' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+# A release tag we will trust enough to cache and later print near a terminal.
+# Anchored allowlist (^v[0-9][0-9A-Za-z.+-]*$) kills ANSI/OSC injection via a
+# crafted tag_name (the API field is attacker-influenced if a release is forged).
+valid_tag() {
+  case "$1" in v[0-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9A-Za-z.+-]*) return 1 ;; esac
+  return 0
+}
+# Probe the latest tag. MUST NOT abort under set -e (fully guarded) and MUST be
+# time-boxed (curl -m 2). Writes a positive or negative cache stamp.
+nudge_probe() {
+  local tag
+  mkdir -p "$(cache_dir)" 2>/dev/null || return 0
+  tag="$(curl -m 2 -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+  if [ -n "$tag" ] && valid_tag "$tag"; then
+    printf '%s %s\n' "$tag" "$(date +%s)" > "$(cache_file)" 2>/dev/null || true
+  else
+    printf -- '- %s\n' "$(date +%s)" > "$(cache_file)" 2>/dev/null || true
+  fi
+  return 0
+}
+# Read the cache. Prints "<tag>" (fresh positive), "-" (fresh negative — a probe
+# failed recently, stay quiet), or nothing (stale/missing → caller should probe).
+# Always returns 0 so it is safe on the right of an assignment under set -e.
+nudge_cache_read() {
+  local f line tag stamp now age
+  f="$(cache_file)"
+  if [ ! -f "$f" ]; then return 0; fi
+  line="$(head -1 "$f" 2>/dev/null || true)"
+  if [ -z "$line" ]; then return 0; fi
+  tag="${line%% *}"; stamp="${line##* }"
+  case "$stamp" in ''|*[!0-9]*) return 0 ;; esac
+  # Force base-10: a leading-zero stamp (e.g. 0888) is an invalid OCTAL literal in
+  # $(( )) and would abort under set -e — an all-digits guard alone is not enough.
+  now="$(date +%s)"; age=$(( now - 10#${stamp} ))
+  if [ "$tag" = "-" ]; then
+    if [ "$age" -lt "$NUDGE_TTL_NEG" ]; then printf -- '-'; fi
+    return 0
+  fi
+  if [ "$age" -ge "$NUDGE_TTL_OK" ]; then return 0; fi
+  if ! valid_tag "$tag"; then return 0; fi
+  printf '%s' "$tag"
+  return 0
+}
+# Emit the upgrade nudge (one ℹ line) when a newer release is known. Uses a fresh
+# cache as-is; probes once when stale/missing. `update` never calls this.
+nudge_line() {
+  local tag
+  tag="$(nudge_cache_read)"
+  if [ -z "$tag" ]; then nudge_probe; tag="$(nudge_cache_read)"; fi
+  if [ -z "$tag" ] || [ "$tag" = "-" ]; then return 0; fi
+  if [ "$tag" = "v${KHUB_VERSION}" ]; then return 0; fi
+  info "khub ${tag} is available — run 'khub upgrade'"
+}
+
+# ---- doctor --report --------------------------------------------------------
+# Redact a block for safe pasting: $HOME → ~ and the gh login (if resolvable) →
+# <user> everywhere (catches a username embedded in a non-HOME path). stdin→stdout.
+redact() {
+  local login
+  login="$(gh api user -q .login 2>/dev/null || true)"
+  if [ -n "$login" ]; then
+    sed -e "s#${HOME}#~#g" -e "s#${login}#<user>#g"
+  else
+    sed -e "s#${HOME}#~#g"
+  fi
+}
+# Emit a fenced, redacted diagnostic block. Printed even when checks FAIL (that
+# is its use case). Args: <hub_path_or_empty> <fail_count>.
+doctor_report() {
+  local hub="$1" fails="$2"
+  local os git_v gh_v auth repo_disp snap botauth ffclean age
+  os="$(uname -sm 2>/dev/null || echo unknown)"
+  git_v="$(git --version 2>/dev/null || echo 'not installed')"
+  gh_v="$(gh --version 2>/dev/null | head -1 || echo 'not installed')"
+  if have_gh && gh_authed; then
+    auth="authenticated (host: $(gh auth status 2>&1 | sed -n 's/.*Logged in to \([^ ]*\).*/\1/p' | head -1 || echo github.com))"
+  else
+    auth="not authenticated"
+  fi
+  if [ -n "${KHUB_CLIENT_REPO:-}" ]; then repo_disp="custom (env-set)"; else repo_disp="default"; fi
+  snap="none"; botauth="n/a"; ffclean="n/a"; age=""
+  if [ -n "$hub" ] && has_commits "$hub"; then
+    snap="$(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
+    if age="$(snapshot_age_days "$hub")"; then :; else age=""; fi
+    if is_bot_snapshot "$hub"; then botauth="yes"; else botauth="no"; fi
+    if has_local_commits "$hub"; then ffclean="no"; else ffclean="yes"; fi
+  fi
+  {
+    printf '```\n'
+    printf 'khub %s\n' "$KHUB_VERSION"
+    printf 'os: %s\n' "$os"
+    printf 'bash: %s\n' "${BASH_VERSION:-unknown}"
+    printf 'git: %s\n' "$git_v"
+    printf 'gh: %s\n' "$gh_v"
+    printf 'gh auth: %s\n' "$auth"
+    printf 'client repo: %s\n' "$repo_disp"
+    if [ -n "$hub" ]; then printf 'hub path: %s\n' "$hub"; else printf 'hub path: not found\n'; fi
+    printf 'snapshot: %s\n' "$snap"
+    if [ -n "$age" ]; then printf 'snapshot age: %sd\n' "$age"; fi
+    printf 'bot-authored: %s\n' "$botauth"
+    printf 'ff-clean: %s\n' "$ffclean"
+    printf 'checks failed: %s\n' "$fails"
+    printf '```\n'
+  } | redact
+}
+
 # ---- verbs ------------------------------------------------------------------
 cmd_version() {
-  say "khub ${KHUB_VERSION}"
+  printf '%skhub %s%s\n' "$c_bold" "$KHUB_VERSION" "$c_reset"
   local hub; if hub="$(find_hub_dir "${1:-}")" && is_git_repo "$hub"; then
-    say "hub clone: $hub"
+    detail "hub clone: $(tilde "$hub")"
     if ! has_commits "$hub"; then
-      say "latest snapshot: none yet (empty clone — no snapshot published)"
+      detail "latest snapshot: none yet (empty clone — no snapshot published)"
     elif is_bot_snapshot "$hub"; then
-      say "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
+      detail "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
     else
-      say "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
+      detail "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
     fi
   else
-    say "hub clone: not found (run 'khub init')"
+    detail "hub clone: not found (run 'khub init')"
   fi
+  nudge_line
 }
 
 preflight() {
@@ -125,34 +291,65 @@ cmd_init() {
       die "path already exists and is not a hub clone: $target"
     fi
   fi
-  say "Preflight…"; preflight; say "  ok — git, gh auth, API + clone access all good"
-  say "Cloning ${CLIENT_REPO} -> ${target}"
+  title "khub init"
+  say "Preflight…"; preflight; ok "git, gh auth, API + clone access all good"
+  say "Cloning ${CLIENT_REPO} → $(tilde "$target")"
   gh repo clone "$CLIENT_REPO" "$target" >/dev/null 2>&1 || die "clone failed" "re-run 'khub doctor' to diagnose"
   say ""
   if ! has_commits "$target"; then
     warn "the client repo has no published snapshot yet — the clone is empty for now."
-    say  "  Run 'khub update' once the first snapshot is published; nothing else to do."
+    hint "run 'khub update' once the first snapshot is published; nothing else to do."
     return 0
   fi
-  say "Done. The hub is at ${target} (pull-only — keep it current with 'khub update')."
+  ok "the hub is at $(tilde "$target") (pull-only — keep it current with 'khub update')."
   say "Next steps:"
-  say "  • Point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
-  say "  • Read the entry point:          ${target}/AGENTS.md"
-  say "  • Health check any time:         khub doctor"
+  hint "point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
+  hint "read the entry point:          ${target}/AGENTS.md"
+  hint "health check any time:         khub doctor"
 }
 
 cmd_update() {
-  local path="" reset=0
+  local path="" reset=0 dryrun=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --path) path="${2:-}"; shift 2 ;;
       --reset) reset=1; shift ;;
+      --dry-run) dryrun=1; shift ;;
       *) die "unknown option for update: $1" "see 'khub help'";;
     esac
   done
+  if [ "$dryrun" = "1" ] && [ "$reset" = "1" ]; then die "--dry-run and --reset are mutually exclusive" "pick one"; fi
   local hub; hub="$(find_hub_dir "$path")" || die "no ${HUB_DIRNAME}/ clone found" "run 'khub init' first, or pass --path DIR"
   is_git_repo "$hub" || die "$hub is not a git clone" "re-clone with 'khub init'"
-  say "Updating hub at ${hub}…"
+
+  # --- dry-run: fetch, report what WOULD change, never move HEAD ---
+  if [ "$dryrun" = "1" ]; then
+    title "khub update --dry-run — $(tilde "$hub")"
+    git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
+    if ! has_commits "$hub"; then
+      if git -C "$hub" rev-parse '@{u}' >/dev/null 2>&1; then
+        say "a first snapshot is available — run 'khub update' to pull it."
+      else
+        say "no snapshot published yet — nothing to preview."
+      fi
+      return 0
+    fi
+    if git -C "$hub" merge-base --is-ancestor HEAD '@{u}' 2>/dev/null; then
+      if [ -n "$(git -C "$hub" rev-list 'HEAD..@{u}' 2>/dev/null)" ]; then
+        say "incoming snapshots (not yet applied):"
+        git -C "$hub" log --oneline --no-decorate 'HEAD..@{u}' | while IFS= read -r l; do detail "$l"; done
+        detail "$(git -C "$hub" diff --stat 'HEAD..@{u}' | tail -1)"
+        hint "run 'khub update' to apply"
+      else
+        ok "up to date — nothing to apply."
+      fi
+    else
+      warn "local history has diverged — cannot fast-forward; run 'khub doctor'."
+    fi
+    return 0
+  fi
+
+  title "khub update — $(tilde "$hub")"
   git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
 
   # Empty clone (client repo had no snapshot when it was cloned): pull the first
@@ -160,18 +357,21 @@ cmd_update() {
   if ! has_commits "$hub"; then
     if git -C "$hub" rev-parse '@{u}' >/dev/null 2>&1; then
       git -C "$hub" merge --ff-only --quiet '@{u}' || die "could not pull the first snapshot" "run 'khub doctor'"
-      say "pulled the first snapshot: $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+      ok "pulled the first snapshot: $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
     else
       say "no snapshot published yet — nothing to update (try again after the first publish)."
     fi
     return 0
   fi
 
+  # Capture HEAD before the merge so we can show exactly what came in.
+  local old; old="$(git -C "$hub" rev-parse HEAD)"
+
   if [ "$reset" = "1" ]; then
-    printf 'This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$hub"
+    printf '%s%s%s This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$c_ylw" "$g_warn" "$c_reset" "$hub"
     read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
     git -C "$hub" reset --hard '@{u}' --quiet && git -C "$hub" clean -fd >/dev/null 2>&1
-    say "reset to the latest snapshot."
+    ok "reset to the latest snapshot."
   elif git -C "$hub" merge-base --is-ancestor HEAD '@{u}' 2>/dev/null; then
     git -C "$hub" merge --ff-only --quiet '@{u}' || die "fast-forward failed unexpectedly" "run 'khub doctor'"
   else
@@ -190,12 +390,26 @@ cmd_update() {
     fi
   fi
 
+  # What's-new: if HEAD moved (fast-forward only), show the incoming snapshot
+  # subjects (capped) + the diffstat summary line.
+  local new; new="$(git -C "$hub" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$reset" != "1" ] && [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+    local n; n="$(git -C "$hub" rev-list --count "${old}..${new}" 2>/dev/null || echo 0)"
+    say "what's new (${n} snapshot(s)):"
+    # Cap with git itself (-n 20), NOT `| head`: piping to head SIGPIPEs git on a
+    # large catch-up, and under pipefail+set -e that would abort update AFTER the
+    # merge already landed, skipping the tamper/staleness checks below.
+    git -C "$hub" log -n 20 --oneline --no-decorate "${old}..${new}" 2>/dev/null | while IFS= read -r l; do detail "$l"; done
+    if [ "$n" -gt 20 ]; then detail "… and $((n - 20)) more"; fi
+    detail "$(git -C "$hub" diff --stat "${old}..${new}" 2>/dev/null | tail -1)"
+  fi
+
   # post-update sanity: is this a genuine, fresh, untampered snapshot?
   if [ ! -f "$hub/AGENTS.md" ] || [ ! -f "$hub/.knowledge/README.md" ]; then
     warn "expected hub files missing — the clone may be corrupt (re-init)"
   fi
   if is_bot_snapshot "$hub"; then
-    say "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+    ok "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
   else
     warn "latest commit is not a published snapshot (subject: '$(latest_subject "$hub")') — possible tampering"
   fi
@@ -205,66 +419,120 @@ cmd_update() {
 }
 
 cmd_doctor() {
-  local path=""
-  case "${1:-}" in --path) path="${2:-}";; esac
-  say "khub doctor — ${CLIENT_REPO}"
-  local fails=0
-  if have_git; then ok "git installed"; else bad "git not installed — install git"; fails=$((fails+1)); fi
-  if have_gh; then ok "gh installed"; else bad "gh not installed — https://cli.github.com"; fails=$((fails+1)); fi
-  if have_gh && gh_authed; then ok "gh authenticated"; else bad "gh not authenticated — run 'gh auth login'"; fails=$((fails+1)); fi
-  if have_gh && gh_authed && api_access; then ok "API access to ${CLIENT_REPO}"; else bad "no access to ${CLIENT_REPO} — ask the owner to add you as a collaborator"; fails=$((fails+1)); fi
-  if have_gh && gh_authed && git_transport_access; then ok "git clone access (transport)"; else bad "git cannot clone — run 'gh auth setup-git'"; fails=$((fails+1)); fi
+  local path="" report=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path) path="${2:-}"; shift 2 ;;
+      --report) report=1; shift ;;
+      *) die "unknown option for doctor: $1" "see 'khub help'";;
+    esac
+  done
+  title "khub doctor — ${CLIENT_REPO}"
+  local fails=0 hub=""
 
-  local hub
+  frame_section "SYSTEM"
+  if have_git; then fok "git installed"; else fbad "git not installed"; fhint "install git"; fails=$((fails+1)); fi
+  if have_gh; then fok "gh installed"; else fbad "gh not installed"; fhint "https://cli.github.com"; fails=$((fails+1)); fi
+
+  frame_section "ACCESS"
+  if have_gh && gh_authed; then fok "gh authenticated"; else fbad "gh not authenticated"; fhint "run 'gh auth login'"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && api_access; then fok "API access to ${CLIENT_REPO}"; else fbad "no access to ${CLIENT_REPO}"; fhint "ask the owner to add you as a collaborator"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && git_transport_access; then fok "git clone access (transport)"; else fbad "git cannot clone"; fhint "run 'gh auth setup-git'"; fails=$((fails+1)); fi
+
+  frame_section "HUB CLONE"
   if hub="$(find_hub_dir "$path")"; then
-    ok "hub clone found at $hub"
+    fok "hub clone found at $(tilde "$hub")"
     if ! is_git_repo "$hub"; then
-      bad "$hub exists but is not a git clone — re-init"; fails=$((fails+1))
+      fbad "$(tilde "$hub") exists but is not a git clone"; fhint "re-init"; fails=$((fails+1)); hub=""
     elif ! has_commits "$hub"; then
-      # Empty clone: the client repo has no published snapshot yet. Normal
-      # pre-launch state, not a failure or tampering.
-      warn "clone is empty — no snapshot published yet (run 'khub update' after the first publish)"
+      fwarn "clone is empty — no snapshot published yet (run 'khub update' after the first publish)"
     else
-      if is_bot_snapshot "$hub"; then ok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else bad "latest commit is NOT a published snapshot — possible tampering (re-init)"; fails=$((fails+1)); fi
-      if has_local_commits "$hub"; then bad "clone has local commits — it is pull-only; move work to your own repos"; fails=$((fails+1)); else ok "clone is fast-forward-clean (no local commits)"; fi
+      if is_bot_snapshot "$hub"; then fok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else fbad "latest commit is NOT a published snapshot"; fhint "possible tampering — re-init"; fails=$((fails+1)); fi
+      if has_local_commits "$hub"; then fbad "clone has local commits — it is pull-only"; fhint "move work to your own repos"; fails=$((fails+1)); else fok "clone is fast-forward-clean (no local commits)"; fi
       local age; if age="$(snapshot_age_days "$hub")"; then
-        if [ "$age" -gt "$STALE_DAYS" ]; then warn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else ok "snapshot is fresh (${age}d old)"; fi
+        if [ "$age" -gt "$STALE_DAYS" ]; then fwarn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else fok "snapshot is fresh (${age}d old)"; fi
       fi
     fi
   else
     # The BOOTSTRAP #1 footgun: a code repo whose CLAUDE.md points at a hub that
     # is not checked out beside it.
     if [ -f "./CLAUDE.md" ] && grep -q "knowledge-hub" ./CLAUDE.md 2>/dev/null; then
-      bad "this repo points at ../${HUB_DIRNAME} but no hub clone is beside it — run: khub init .."
+      fbad "this repo points at ../${HUB_DIRNAME} but no hub clone is beside it"; fhint "run: khub init .."
     else
-      bad "no ${HUB_DIRNAME}/ clone found — run 'khub init'"
+      fbad "no ${HUB_DIRNAME}/ clone found"; fhint "run 'khub init'"
     fi
-    fails=$((fails+1))
+    fails=$((fails+1)); hub=""
   fi
 
+  # A newer CLI is worth surfacing here, before the verdict.
+  nudge_line
+  # The report prints BEFORE the summary and EVEN WHEN checks failed — that is
+  # exactly when a copy-paste diagnostic is wanted. Exit code below is preserved.
+  if [ "$report" = "1" ]; then say ""; doctor_report "$hub" "$fails"; fi
+
   say ""
-  if [ "$fails" -eq 0 ]; then say "${c_grn}all checks passed${c_reset}"; else say "${c_red}${fails} check(s) failed${c_reset} — see fixes above"; return 1; fi
+  if [ "$fails" -eq 0 ]; then
+    printf '%s%s%s all checks passed\n' "$c_grn" "$g_ok" "$c_reset"
+  else
+    printf '%s%s%s %s check(s) failed — see fixes above\n' "$c_red" "$g_bad" "$c_reset" "$fails"
+    return 1
+  fi
 }
 
 cmd_upgrade() {
-  # Self-update the CLI to the latest published release. SEPARATE from `khub
-  # update` (which refreshes your hub CONTENT clone). Fetches install.sh from the
-  # latest release (a pinned asset, never a mutable branch) and runs it against
-  # the directory the current `khub` lives in.
-  # This build takes no upgrade options. Reject unknown args rather than silently
-  # ignoring them, so running a flag that a NEWER khub documents gives a clear
-  # error instead of an unexpected full reinstall.
-  [ $# -eq 0 ] || die "unknown option for upgrade: $1" "this khub (${KHUB_VERSION}) takes no upgrade options — newer versions add them"
+  local check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; shift ;;
+      *) die "unknown option for upgrade: $1" "see 'khub help'";;
+    esac
+  done
   command -v curl >/dev/null 2>&1 || die "curl is required to upgrade" "install curl, then re-run"
   local self bindir tag
   self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"
   bindir="$(dirname "$self")"
-  tag="$(curl -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  tag="$(curl -m 2 -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
   [ -n "$tag" ] || die "could not resolve the latest khub release" "check your network"
-  say "Upgrading khub (${KHUB_VERSION} → ${tag}) in ${bindir}…"
-  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/install.sh" \
-    | KHUB_INSTALL_VERSION="$tag" KHUB_BIN_DIR="$bindir" bash \
+  valid_tag "$tag" || die "the latest release tag looks malformed — refusing to act on it" "reinstall via the README one-liner"
+  # Refresh the nudge cache from this live probe: keeps version/doctor honest and
+  # prevents nudging "backward" right after a direct upgrade.
+  if mkdir -p "$(cache_dir)" 2>/dev/null; then printf '%s %s\n' "$tag" "$(date +%s)" > "$(cache_file)" 2>/dev/null || true; fi
+
+  if [ "$check" = "1" ]; then
+    if [ "$tag" = "v${KHUB_VERSION}" ]; then
+      ok "khub is up to date (${tag})."
+    else
+      title "khub upgrade --check"
+      say "current: v${KHUB_VERSION}"
+      say "latest:  ${tag}"
+      hint "run 'khub upgrade' to update"
+    fi
+    return 0
+  fi
+
+  if [ "$tag" = "v${KHUB_VERSION}" ]; then ok "already on the latest khub (${tag})."; return 0; fi
+
+  title "Upgrading khub (v${KHUB_VERSION} → ${tag}) in $(tilde "$bindir")"
+  # Verified upgrade: download install.sh AND SHA256SUMS for this tag, verify the
+  # installer BEFORE executing it (no more blind curl|bash). The installer then
+  # re-verifies the binary itself.
+  local sh_tmp sums_tmp expected actual
+  # tmpd is deliberately NOT `local`: the EXIT trap fires in the global scope
+  # after this function returns, so a local would be out of scope there and
+  # set -u would abort the trap with "tmpd: unbound variable".
+  tmpd="$(mktemp -d)" || die "could not create a temp directory"
+  trap 'rm -rf "$tmpd"' EXIT
+  sh_tmp="$tmpd/install.sh"; sums_tmp="$tmpd/SHA256SUMS"
+  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/install.sh" -o "$sh_tmp" \
+    || die "could not download the installer for ${tag}" "retry, or reinstall via the README one-liner"
+  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/SHA256SUMS" -o "$sums_tmp" \
+    || die "no checksums published for ${tag} — refusing to run an unverified installer" "retry later, or reinstall via the README one-liner"
+  expected="$(awk '$2 == "install.sh" { print $1 }' "$sums_tmp")"
+  [ -n "$expected" ] || die "checksums for ${tag} have no install.sh entry" "reinstall via the README one-liner"
+  actual="$(sha256_of "$sh_tmp")" || die "no sha256 tool (shasum/sha256sum) available — cannot verify"
+  [ "$actual" = "$expected" ] || die "installer checksum mismatch for ${tag} — refusing to run it" "retry later, or reinstall via the README one-liner"
+  KHUB_INSTALL_VERSION="$tag" KHUB_BIN_DIR="$bindir" bash "$sh_tmp" \
     || die "upgrade failed" "re-run the install one-liner from the ${KHUB_REPO} README"
 }
 
@@ -274,11 +542,15 @@ khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
 
 usage:
   khub init [dir]        clone the hub as a sibling under dir (default: current dir)
-  khub update [--path D] [--reset]
+  khub update [--path D] [--dry-run] [--reset]
                          update your hub CONTENT clone to the latest snapshot
-                         (--reset discards local changes, confirms first)
-  khub upgrade           update the khub CLI itself to the latest release
-  khub doctor [--path D] diagnose auth, access, sibling layout, and freshness
+                         (--dry-run previews without changing anything;
+                          --reset discards local changes, confirms first)
+  khub upgrade [--check] update the khub CLI itself to the latest release
+                         (--check only reports whether a newer release exists)
+  khub doctor [--path D] [--report]
+                         diagnose auth, access, sibling layout, and freshness
+                         (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
   khub help              this message
 
