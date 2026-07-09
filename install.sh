@@ -5,7 +5,7 @@ set -euo pipefail
 # mutable branch) and installs it to ~/.local/bin. Verify integrity against the
 # SHA256 published in the release notes (printed at the end).
 #
-#   curl -sfL https://raw.githubusercontent.com/blueblazedev/khub/v0.1.0/install.sh | bash
+#   curl -sfL https://github.com/blueblazedev/khub/releases/latest/download/install.sh | bash
 #
 # Override the target dir with KHUB_BIN_DIR, or pin a version with
 # KHUB_INSTALL_VERSION=vX.Y.Z (default: the latest published release).

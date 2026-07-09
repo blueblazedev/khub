@@ -14,7 +14,7 @@ set -euo pipefail
 # back at ../knowledge-hub for context. Never commit into the clone.
 # =============================================================================
 
-KHUB_VERSION="0.1.0"
+KHUB_VERSION="0.1.1"
 ORG="blueblazedev"
 KHUB_REPO="${ORG}/khub"   # where the CLI itself lives (for self-upgrade)
 CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"

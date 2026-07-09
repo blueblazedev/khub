@@ -10,18 +10,19 @@ own `gh` login**. Its only dependencies are **git** and **gh** (the GitHub CLI).
 ## Install
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/blueblazedev/khub/v0.1.0/install.sh \
-  | KHUB_INSTALL_VERSION=v0.1.0 bash
+curl -sfL https://github.com/blueblazedev/khub/releases/latest/download/install.sh | bash
 ```
 
-Pinning `KHUB_INSTALL_VERSION` to the same tag as the `install.sh` URL keeps the
-installer and the `khub` binary on the same release (without it, `install.sh`
-fetches the *latest* release). This installs to `~/.local/bin`; then verify the
-binary against the SHA256 published in that release's notes:
+This always installs the **latest release** (a stable URL — no version to bump).
+It lands in `~/.local/bin`; verify the binary against the SHA256 in that release's
+notes:
 
 ```bash
 shasum -a 256 ~/.local/bin/khub
 ```
+
+After that first install, keep the CLI current with **`khub upgrade`** — no need
+to remember this command again.
 
 ## Onboard in 3 commands
 
