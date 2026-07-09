@@ -55,11 +55,16 @@ find_hub_dir() {
   local p="$1"
   if [ -n "$p" ]; then if [ -d "$p" ]; then printf '%s' "$p"; return 0; else return 1; fi; fi
   if [ -f "./AGENTS.md" ] && [ -d "./.knowledge" ]; then printf '%s' "." && return 0; fi
-  if [ -d "./$HUB_DIRNAME/.knowledge" ]; then printf '%s' "./$HUB_DIRNAME" && return 0; fi
-  if [ -d "../$HUB_DIRNAME/.knowledge" ]; then printf '%s' "../$HUB_DIRNAME" && return 0; fi
+  # A knowledge-hub/ clone counts even before its first snapshot lands (empty repo
+  # → no .knowledge yet). Accept a git clone by its .git so a fresh `khub init`
+  # is diagnosed here — NOT silently skipped in favour of an unrelated sibling.
+  # ./knowledge-hub is checked before ../knowledge-hub so a local clone always wins.
+  if [ -d "./$HUB_DIRNAME/.knowledge" ] || [ -e "./$HUB_DIRNAME/.git" ]; then printf '%s' "./$HUB_DIRNAME" && return 0; fi
+  if [ -d "../$HUB_DIRNAME/.knowledge" ] || [ -e "../$HUB_DIRNAME/.git" ]; then printf '%s' "../$HUB_DIRNAME" && return 0; fi
   return 1
 }
 is_git_repo()      { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
+has_commits()      { git -C "$1" rev-parse HEAD >/dev/null 2>&1; }   # false on a just-cloned empty repo
 latest_subject()   { git -C "$1" log -1 --pretty=%s 2>/dev/null; }
 latest_author()    { git -C "$1" log -1 --pretty=%an 2>/dev/null; }
 latest_short_sha() { git -C "$1" log -1 --pretty=%h 2>/dev/null; }
@@ -88,7 +93,9 @@ cmd_version() {
   say "khub ${KHUB_VERSION}"
   local hub; if hub="$(find_hub_dir "${1:-}")" && is_git_repo "$hub"; then
     say "hub clone: $hub"
-    if is_bot_snapshot "$hub"; then
+    if ! has_commits "$hub"; then
+      say "latest snapshot: none yet (empty clone — no snapshot published)"
+    elif is_bot_snapshot "$hub"; then
       say "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
     else
       say "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
@@ -121,6 +128,11 @@ cmd_init() {
   say "Cloning ${CLIENT_REPO} -> ${target}"
   gh repo clone "$CLIENT_REPO" "$target" >/dev/null 2>&1 || die "clone failed" "re-run 'khub doctor' to diagnose"
   say ""
+  if ! has_commits "$target"; then
+    warn "the client repo has no published snapshot yet — the clone is empty for now."
+    say  "  Run 'khub update' once the first snapshot is published; nothing else to do."
+    return 0
+  fi
   say "Done. The hub is at ${target} (pull-only — keep it current with 'khub update')."
   say "Next steps:"
   say "  • Point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
@@ -141,6 +153,18 @@ cmd_update() {
   is_git_repo "$hub" || die "$hub is not a git clone" "re-clone with 'khub init'"
   say "Updating hub at ${hub}…"
   git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
+
+  # Empty clone (client repo had no snapshot when it was cloned): pull the first
+  # snapshot if one now exists, otherwise there is simply nothing to update yet.
+  if ! has_commits "$hub"; then
+    if git -C "$hub" rev-parse '@{u}' >/dev/null 2>&1; then
+      git -C "$hub" merge --ff-only --quiet '@{u}' || die "could not pull the first snapshot" "run 'khub doctor'"
+      say "pulled the first snapshot: $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+    else
+      say "no snapshot published yet — nothing to update (try again after the first publish)."
+    fi
+    return 0
+  fi
 
   if [ "$reset" = "1" ]; then
     printf 'This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$hub"
@@ -193,14 +217,18 @@ cmd_doctor() {
   local hub
   if hub="$(find_hub_dir "$path")"; then
     ok "hub clone found at $hub"
-    if is_git_repo "$hub"; then
+    if ! is_git_repo "$hub"; then
+      bad "$hub exists but is not a git clone — re-init"; fails=$((fails+1))
+    elif ! has_commits "$hub"; then
+      # Empty clone: the client repo has no published snapshot yet. Normal
+      # pre-launch state, not a failure or tampering.
+      warn "clone is empty — no snapshot published yet (run 'khub update' after the first publish)"
+    else
       if is_bot_snapshot "$hub"; then ok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else bad "latest commit is NOT a published snapshot — possible tampering (re-init)"; fails=$((fails+1)); fi
       if has_local_commits "$hub"; then bad "clone has local commits — it is pull-only; move work to your own repos"; fails=$((fails+1)); else ok "clone is fast-forward-clean (no local commits)"; fi
       local age; if age="$(snapshot_age_days "$hub")"; then
         if [ "$age" -gt "$STALE_DAYS" ]; then warn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else ok "snapshot is fresh (${age}d old)"; fi
       fi
-    else
-      bad "$hub exists but is not a git clone — re-init"; fails=$((fails+1))
     fi
   else
     # The BOOTSTRAP #1 footgun: a code repo whose CLAUDE.md points at a hub that
