@@ -53,7 +53,7 @@ gh_clone_url() {
 # parent (when run from inside a code repo that sits beside the hub).
 find_hub_dir() {
   local p="$1"
-  if [ -n "$p" ]; then [ -d "$p" ] && printf '%s' "$p" && return 0 || return 1; fi
+  if [ -n "$p" ]; then if [ -d "$p" ]; then printf '%s' "$p"; return 0; else return 1; fi; fi
   if [ -f "./AGENTS.md" ] && [ -d "./.knowledge" ]; then printf '%s' "." && return 0; fi
   if [ -d "./$HUB_DIRNAME/.knowledge" ]; then printf '%s' "./$HUB_DIRNAME" && return 0; fi
   if [ -d "../$HUB_DIRNAME/.knowledge" ]; then printf '%s' "../$HUB_DIRNAME" && return 0; fi
@@ -238,7 +238,7 @@ EOF
 
 # ---- dispatch ---------------------------------------------------------------
 main() {
-  local cmd="${1:-help}"; [ $# -gt 0 ] && shift || true
+  local cmd="${1:-help}"; if [ $# -gt 0 ]; then shift; fi
   case "$cmd" in
     init)            cmd_init "$@" ;;
     update)          cmd_update "$@" ;;
