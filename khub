@@ -139,7 +139,7 @@ cmd_update() {
   done
   local hub; hub="$(find_hub_dir "$path")" || die "no ${HUB_DIRNAME}/ clone found" "run 'khub init' first, or pass --path DIR"
   is_git_repo "$hub" || die "$hub is not a git clone" "re-clone with 'khub init'"
-  say "Updating hub at $hub…"
+  say "Updating hub at ${hub}…"
   git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
 
   if [ "$reset" = "1" ]; then
