@@ -1,0 +1,74 @@
+name: release
+
+# A `v*` tag push cuts a release: three assets (khub, install.sh, SHA256SUMS)
+# plus a build-provenance attestation on each executable asset. Two authorization
+# gates guard the signing key: only the owner can create `v*` tags (repo ruleset),
+# and this workflow additionally refuses any tag whose commit is not an ancestor
+# of `main` — an unreviewed commit must never become a signed release.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write        # gh release create
+  id-token: write        # OIDC token for the attestation
+  attestations: write    # write the build-provenance attestation
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10   # v6.0.3
+        with:
+          fetch-depth: 0   # full history so the ancestor-of-main check can resolve
+
+      - name: Refuse a tag whose commit is not on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of main — refusing to sign an unreviewed commit"
+            exit 1
+          fi
+          echo "ok: ${GITHUB_SHA} is on main"
+
+      - name: Re-run CI gates
+        run: |
+          set -euo pipefail
+          shellcheck khub install.sh
+          /bin/bash -n khub
+          /bin/bash -n install.sh
+
+      - name: Generate SHA256SUMS
+        run: sha256sum khub install.sh > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}   # gh in Actions does not auto-authenticate from job permissions
+        run: |
+          set -euo pipefail
+          {
+            printf '## Verify your download\n\n'
+            printf 'SHA256 checksums — same-channel integrity (catches a corrupted, truncated,\n'
+            printf 'or partial download; not a compromised release):\n\n'
+            printf '```\n'
+            cat SHA256SUMS
+            printf '```\n\n'
+            printf 'Build provenance is attested to this release workflow. After `gh auth login`:\n\n'
+            printf '```\n'
+            printf 'gh attestation verify khub --repo %s --signer-workflow %s/.github/workflows/release.yml\n' "$GITHUB_REPOSITORY" "$GITHUB_REPOSITORY"
+            printf '```\n'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" khub install.sh SHA256SUMS \
+            --title "khub $GITHUB_REF_NAME" \
+            --notes-file notes.md
+
+      # Attest AFTER the release exists: a failed release run must not leave
+      # attestations minted for bytes that never shipped.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373   # v4.1.1
+        with:
+          subject-path: |
+            khub
+            install.sh
