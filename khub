@@ -14,7 +14,7 @@ set -euo pipefail
 # back at ../knowledge-hub for context. Never commit into the clone.
 # =============================================================================
 
-KHUB_VERSION="0.1.1"
+KHUB_VERSION="0.1.2"
 ORG="blueblazedev"
 KHUB_REPO="${ORG}/khub"   # where the CLI itself lives (for self-upgrade)
 CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"
@@ -251,6 +251,10 @@ cmd_upgrade() {
   # update` (which refreshes your hub CONTENT clone). Fetches install.sh from the
   # latest release (a pinned asset, never a mutable branch) and runs it against
   # the directory the current `khub` lives in.
+  # This build takes no upgrade options. Reject unknown args rather than silently
+  # ignoring them, so running a flag that a NEWER khub documents gives a clear
+  # error instead of an unexpected full reinstall.
+  [ $# -eq 0 ] || die "unknown option for upgrade: $1" "this khub (${KHUB_VERSION}) takes no upgrade options — newer versions add them"
   command -v curl >/dev/null 2>&1 || die "curl is required to upgrade" "install curl, then re-run"
   local self bindir tag
   self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"

@@ -13,16 +13,46 @@ own `gh` login**. Its only dependencies are **git** and **gh** (the GitHub CLI).
 curl -sfL https://github.com/blueblazedev/khub/releases/latest/download/install.sh | bash
 ```
 
-This always installs the **latest release** (a stable URL — no version to bump).
-It lands in `~/.local/bin`; verify the binary against the SHA256 in that release's
-notes:
-
-```bash
-shasum -a 256 ~/.local/bin/khub
-```
+This always installs the **latest release** (a stable URL — no version to bump)
+into `~/.local/bin`. The installer **verifies the download against that release's
+published `SHA256SUMS` before installing** — a mismatch or a missing checksum
+fails closed and installs nothing, leaving any existing `khub` untouched.
 
 After that first install, keep the CLI current with **`khub upgrade`** — no need
 to remember this command again.
+
+## Verifying your install
+
+Two independent, deliberately honest guarantees:
+
+- **Checksum (`SHA256SUMS`)** — published as a release asset and auto-checked by
+  the installer. It is *same-channel*: it catches a corrupted, truncated, or
+  partial download. On its own it does **not** prove a release wasn't tampered
+  with at the source.
+- **Build-provenance attestation** — each release's `khub` and `install.sh` are
+  attested to this repo's `release.yml` workflow. With the GitHub CLI (`gh`
+  ≥ 2.49) authenticated, confirm an artifact was built by that workflow:
+
+  ```bash
+  gh attestation verify ~/.local/bin/khub \
+    --repo blueblazedev/khub \
+    --signer-workflow blueblazedev/khub/.github/workflows/release.yml
+  ```
+
+  `--signer-workflow` matters: a bare `--repo` predicate matches *any* artifact
+  this repo has ever built (including an older version), so it proves origin —
+  **not** which version you hold. Version binding comes from the tag-pinned
+  download URL and that tag's `SHA256SUMS`. The installer prints this command but
+  never runs `gh` itself (`gh` is not an install dependency and needs its own
+  login).
+
+## Releases
+
+Releases are cut by pushing a `v*` tag, which runs the `release.yml` workflow: it
+re-runs the CI gates, then publishes `khub`, `install.sh`, and `SHA256SUMS` and
+attests both executables. Tags whose commit is not on `main` are refused, and
+only the owner can create `v*` tags. (`v0.1.0`/`v0.1.1` were cut manually and
+carry no `SHA256SUMS` — install those only via the legacy pin below.)
 
 ## Onboard in 3 commands
 
@@ -85,6 +115,20 @@ Run `khub doctor` — it checks each prerequisite and prints the exact fix:
 - **`git cannot clone`** (API works but clone fails) → `gh auth setup-git`
 - **`no knowledge-hub/ clone found`** → `khub init`
 - **`points at ../knowledge-hub but no hub clone is beside it`** → `khub init ..`
+
+## Installing a legacy release (advanced)
+
+Releases before `v0.1.2` predate `SHA256SUMS`, so the installer cannot verify
+them and will fail closed. To install one on purpose, set `KHUB_SKIP_VERIFY=1` —
+this **disables integrity checking** and should be used only for a known legacy
+pin:
+
+```bash
+curl -sfL https://github.com/blueblazedev/khub/releases/latest/download/install.sh \
+  | KHUB_INSTALL_VERSION=v0.1.1 KHUB_SKIP_VERIFY=1 bash
+```
+
+Prefer `v0.1.2` or later, which are checksum-verified automatically.
 
 ## License
 
