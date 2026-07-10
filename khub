@@ -584,6 +584,9 @@ tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.c
 tel_task_file()   { printf '%s/khub/telemetry-task' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_salt_file()   { printf '%s/khub/telemetry-salt' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_cohort_file() { printf '%s/khub/telemetry-cohort' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_debug_file()  { printf '%s/khub/telemetry-debug' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+# count directory entries without `ls | wc` (SC2012-clean, glob-safe)
+tel_count() { local n=0 f; for f in "$1"/*; do [ -e "$f" ] && n=$((n+1)); done; printf '%d' "$n"; }
 # A per-install random salt, generated ONCE and kept stable, so the fingerprint's
 # identity fields (repo id, skill names) are HMAC'd — an aggregator can't reverse a
 # guessable input. Never leaves the machine.
@@ -748,7 +751,7 @@ track_disable() {
   fi
   rm -f "$(tel_hook_file)" 2>/dev/null || true
   rm -f "$(tel_config_file)" 2>/dev/null || true
-  rm -f "$(tel_task_file)" "$(tel_salt_file)" "$(tel_cohort_file)" 2>/dev/null || true
+  rm -f "$(tel_task_file)" "$(tel_salt_file)" "$(tel_cohort_file)" "$(tel_debug_file)" 2>/dev/null || true
   rm -f "${settings}.khub-lock" 2>/dev/null || true   # persistent flock sibling
   ok "telemetry disabled — hook unregistered and removed"
   detail "settings.json backups are kept for safety (a later 'khub track purge' will remove them + the local store)"
@@ -851,6 +854,59 @@ track_task() {
   hint "totals so far:  khub metrics --by-task"
 }
 
+# Toggle the hook's opt-in debug log (the only visibility into a fail-open hook).
+track_debug() {
+  local df; df="$(tel_debug_file)"
+  case "${1:-status}" in
+    on)  mkdir -p "$(dirname "$df")" 2>/dev/null || die "cannot enable debug logging"
+         : > "$df"; chmod 600 "$df" 2>/dev/null || true
+         ok "telemetry debug logging ON"; hint "reproduce a session, then paste:  khub track doctor" ;;
+    off) rm -f "$df" 2>/dev/null || true; ok "telemetry debug logging OFF" ;;
+    status) if [ -f "$df" ]; then info "debug logging: ON"; else info "debug logging: OFF"; hint "enable: khub track debug on"; fi ;;
+    *) die "usage: khub track debug <on|off>" ;;
+  esac
+}
+
+# A redacted, paste-ready diagnostic ($HOME->~, gh login-><user>) — for sharing with
+# support or for an agent to self-detect why capture isn't happening. Carries only
+# config state, registration, integrity, store counts, and the debug-log tail (which
+# is redacted by construction: outcomes + counts, never prompts/paths).
+track_doctor() {
+  local cfg sd; cfg="$(tel_config_file)"; sd="$(tel_state_dir)"
+  title "khub telemetry — doctor (redacted; safe to paste)"
+  {
+    printf '```\n'
+    printf 'khub %s telemetry doctor\n' "$KHUB_VERSION"
+    printf 'os: %s · python3: %s\n' "$(uname -sm 2>/dev/null || echo unknown)" "$(tel_python3 || echo 'NOT FOUND')"
+    if [ -f "$cfg" ]; then
+      printf 'enabled: %s (scope: %s)\n' "$(tel_config_get enabled || echo '?')" "$(tel_config_get scope || echo user)"
+      printf 'settings: %s\n' "$(tel_config_get settings_path || echo '?')"
+    else
+      printf 'enabled: NO (not configured — run: khub track enable)\n'
+    fi
+    printf 'cohort: %s · salt: %s · debug: %s · task: %s\n' \
+      "$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)" \
+      "$([ -s "$(tel_salt_file)" ] && echo present || echo absent)" \
+      "$([ -f "$(tel_debug_file)" ] && echo on || echo off)" \
+      "$([ -s "$(tel_task_file)" ] && head -1 "$(tel_task_file)" || echo none)"
+    local settings py hook st rec now
+    settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$(tel_config_get scope 2>/dev/null || echo user)")"
+    py="$(tel_config_get python3 || true)"; [ -n "$py" ] || py="$(tel_python3)"
+    hook="$(tel_hook_file)"
+    st="$(tel_merge status "$settings" --command "$(tel_hook_command "$py" "$hook")" 2>/dev/null | tr '\n' ' ' || true)"
+    printf 'registration: %s\n' "${st:-unreadable}"
+    if [ -f "$hook" ]; then
+      rec="$(tel_config_get hook_sha256 || true)"; now="$(sha256_of "$hook" 2>/dev/null || true)"
+      if [ -n "$rec" ] && [ "$rec" = "$now" ]; then printf 'hook integrity: ok\n'; else printf 'hook integrity: MISMATCH (drift/tamper) — run khub track repair\n'; fi
+    else printf 'hook file: MISSING — run khub track repair\n'; fi
+    printf 'store: fingerprints=%s metrics=%s reports=%s captures=%s\n' \
+      "$(tel_count "$sd/fingerprint")" "$(tel_count "$sd/metrics")" "$(tel_count "$sd/report")" "$(tel_count "$sd/capture")"
+    printf -- '--- debug.log tail (last 25) ---\n'
+    if [ -f "$sd/debug.log" ]; then tail -25 "$sd/debug.log"; else printf '(no debug log — run: khub track debug on, reproduce a session, then re-run doctor)\n'; fi
+    printf '```\n'
+  } | redact
+}
+
 cmd_track() {
   tel_prepare   # parent-scope: make embedded helpers available to the subshells below
   local sub="${1:-status}"; if [ $# -gt 0 ]; then shift; fi
@@ -860,7 +916,9 @@ cmd_track() {
     status)  track_status  "$@" ;;
     repair)  track_repair  "$@" ;;
     task)    track_task    "$@" ;;
-    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task" ;;
+    debug)   track_debug   "$@" ;;
+    doctor)  track_doctor  "$@" ;;
+    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task|debug|doctor" ;;
   esac
 }
 
@@ -924,11 +982,12 @@ usage:
                          diagnose auth, access, sibling layout, and freshness
                          (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
-  khub track <enable|disable|status|repair|task>
+  khub track <enable|disable|status|repair|task|debug|doctor>
                          opt-in, LOCAL-ONLY session telemetry (OFF by default)
                          (enable [--project] [--cohort internal|external] registers a
                           hook in settings.json, backing it up first; disable removes
-                          only khub's entries; task <id> books tokens to a ticket)
+                          only khub's entries; task <id> books tokens to a ticket;
+                          debug on|off toggles a log; doctor prints a redacted report)
   khub metrics [--by-task]
                          show the latest session's local report (counts only), or
                          --by-task to total output tokens per ticket across sessions
@@ -1358,6 +1417,7 @@ TRUNC = 2000              # cap raw prompt/response text stored locally
 DROP_ENTRYPOINTS = ("sdk-ts",)   # automation surfaces excluded from the population
 RETAIN_DAYS = 14          # raw capture auto-purge age
 CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits first
+DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
 
 
 # ---- paths / gating ---------------------------------------------------------
@@ -1422,6 +1482,34 @@ def _read_cohort():
             return c or "unset"
     except Exception:
         return "unset"
+
+
+def _debug_on():
+    return os.path.exists(os.path.join(_config_dir(), "telemetry-debug"))
+
+
+def _debug(event, sid, outcome, detail=""):
+    """Append one line to the opt-in debug log documenting WHAT the fail-open hook did
+    and why — the only visibility into a hook that otherwise swallows every error.
+    Redacted BY CONSTRUCTION: event + a short session-id prefix + an outcome label +
+    counts/labels only (never a prompt, path, or exception message). Never raises."""
+    if not _debug_on():
+        return
+    try:
+        state = _state_dir()
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        log = os.path.join(state, "debug.log")
+        sid8 = sid[:8] if isinstance(sid, str) and sid else "-"
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("%s %-12s %-8s %-14s %s\n" % (ts, event or "-", sid8, outcome, detail))
+        with open(log, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        if len(lines) > DEBUG_LOG_MAX_LINES:
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-DEBUG_LOG_MAX_LINES:])
+    except Exception:
+        pass
 
 
 def _salted(salt_hex, value):
@@ -1790,14 +1878,17 @@ def build_fingerprint(session_id, cwd, surface):
 def write_fingerprint(payload):
     sid = payload.get("session_id")
     if not sid:
+        _debug("SessionStart", sid, "no-session-id")
         return
     surface = payload.get("entrypoint") or "unknown"
     if surface in DROP_ENTRYPOINTS:
+        _debug("SessionStart", sid, "dropped-sdk")
         return                       # don't fingerprint automation sessions either
     cwd = payload.get("cwd") or os.getcwd()
     fp = build_fingerprint(sid, cwd, surface)
     _atomic_write(os.path.join(_state_dir(), "fingerprint", "%s.json" % sid),
                   json.dumps(fp, sort_keys=True, indent=2) + "\n")
+    _debug("SessionStart", sid, "ok", "harness=%s salt=%s" % (fp["harness"], fp["has_salt"]))
 
 
 def _read_fingerprint(session_id):
@@ -1811,9 +1902,11 @@ def _read_fingerprint(session_id):
 
 def rollup(session_id, transcript_path):
     if not session_id or not transcript_path or not os.path.isfile(transcript_path):
+        _debug("SessionEnd", session_id, "no-transcript")
         return
     metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
     if entrypoint in DROP_ENTRYPOINTS:
+        _debug("SessionEnd", session_id, "dropped-sdk")
         return                       # automation surface — excluded from the population
     metrics["session_id"] = session_id
     fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
@@ -1832,21 +1925,33 @@ def rollup(session_id, transcript_path):
     cap = os.path.join(state, "capture", "%s.jsonl" % session_id)
     _atomic_write(cap, "".join(json.dumps(t, sort_keys=True) + "\n" for t in raw_turns))
     purge_old_captures(os.path.join(state, "capture"))
+    _debug("SessionEnd", session_id, "ok",
+           "prompts=%d tools=%d out=%d setup=%s"
+           % (metrics["prompts"], metrics["tool_calls_total"], metrics["tokens"]["output"],
+              "yes" if "setup" in metrics else "no"))
 
 
 def main():
     raw = sys.stdin.read()
-    if not _enabled():
-        return
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except Exception:
+        _debug("?", None, "bad-stdin")
         return
     event = payload.get("hook_event_name")
-    if event == "SessionStart":
-        write_fingerprint(payload)
-    elif event == "SessionEnd":
-        rollup(payload.get("session_id"), payload.get("transcript_path"))
+    sid = payload.get("session_id")
+    if not _enabled():
+        _debug(event, sid, "gated-off")   # logged even when off, to reveal that state
+        return
+    try:
+        if event == "SessionStart":
+            write_fingerprint(payload)
+        elif event == "SessionEnd":
+            rollup(sid, payload.get("transcript_path"))
+        else:
+            _debug(event, sid, "ignored-event")
+    except Exception as exc:
+        _debug(event, sid, "error", type(exc).__name__)   # type only — never the message
 
 
 if __name__ == "__main__":

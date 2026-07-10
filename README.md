@@ -130,6 +130,13 @@ and an optional cohort (`khub track enable --cohort internal|external`) — so y
 compare ways of working. Identifying fields (repo id, skill names) are stored only as
 **salted hashes** using a random per-install key that never leaves your machine.
 
+**Troubleshooting.** The hook is fail-open (it never blocks a session), so it's silent
+on errors. If capture isn't happening, turn on the opt-in debug log with `khub track
+debug on`, reproduce a session, then run **`khub track doctor`** — a **redacted,
+paste-ready** report (config, hook registration, integrity, store counts, and the last
+debug lines; `$HOME`→`~`, no prompts/paths/skill names). Safe to share for support or
+for an agent to self-diagnose. `khub track debug off` stops it.
+
 A later release adds `khub export` (metrics-only by default) and `khub track purge`,
 plus a full privacy doc.
 

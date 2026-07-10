@@ -54,3 +54,5 @@ jobs:
           bash tests/telemetry/test_capture_metrics.sh
           # SessionStart setup fingerprint: harness detection, salted identity, join
           bash tests/telemetry/test_fingerprint.sh
+          # opt-in debug log + redacted `track doctor` diagnostic
+          bash tests/telemetry/test_debug_doctor.sh

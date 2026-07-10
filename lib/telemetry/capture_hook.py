@@ -38,6 +38,7 @@ TRUNC = 2000              # cap raw prompt/response text stored locally
 DROP_ENTRYPOINTS = ("sdk-ts",)   # automation surfaces excluded from the population
 RETAIN_DAYS = 14          # raw capture auto-purge age
 CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits first
+DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
 
 
 # ---- paths / gating ---------------------------------------------------------
@@ -102,6 +103,34 @@ def _read_cohort():
             return c or "unset"
     except Exception:
         return "unset"
+
+
+def _debug_on():
+    return os.path.exists(os.path.join(_config_dir(), "telemetry-debug"))
+
+
+def _debug(event, sid, outcome, detail=""):
+    """Append one line to the opt-in debug log documenting WHAT the fail-open hook did
+    and why — the only visibility into a hook that otherwise swallows every error.
+    Redacted BY CONSTRUCTION: event + a short session-id prefix + an outcome label +
+    counts/labels only (never a prompt, path, or exception message). Never raises."""
+    if not _debug_on():
+        return
+    try:
+        state = _state_dir()
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        log = os.path.join(state, "debug.log")
+        sid8 = sid[:8] if isinstance(sid, str) and sid else "-"
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("%s %-12s %-8s %-14s %s\n" % (ts, event or "-", sid8, outcome, detail))
+        with open(log, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        if len(lines) > DEBUG_LOG_MAX_LINES:
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-DEBUG_LOG_MAX_LINES:])
+    except Exception:
+        pass
 
 
 def _salted(salt_hex, value):
@@ -470,14 +499,17 @@ def build_fingerprint(session_id, cwd, surface):
 def write_fingerprint(payload):
     sid = payload.get("session_id")
     if not sid:
+        _debug("SessionStart", sid, "no-session-id")
         return
     surface = payload.get("entrypoint") or "unknown"
     if surface in DROP_ENTRYPOINTS:
+        _debug("SessionStart", sid, "dropped-sdk")
         return                       # don't fingerprint automation sessions either
     cwd = payload.get("cwd") or os.getcwd()
     fp = build_fingerprint(sid, cwd, surface)
     _atomic_write(os.path.join(_state_dir(), "fingerprint", "%s.json" % sid),
                   json.dumps(fp, sort_keys=True, indent=2) + "\n")
+    _debug("SessionStart", sid, "ok", "harness=%s salt=%s" % (fp["harness"], fp["has_salt"]))
 
 
 def _read_fingerprint(session_id):
@@ -491,9 +523,11 @@ def _read_fingerprint(session_id):
 
 def rollup(session_id, transcript_path):
     if not session_id or not transcript_path or not os.path.isfile(transcript_path):
+        _debug("SessionEnd", session_id, "no-transcript")
         return
     metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
     if entrypoint in DROP_ENTRYPOINTS:
+        _debug("SessionEnd", session_id, "dropped-sdk")
         return                       # automation surface — excluded from the population
     metrics["session_id"] = session_id
     fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
@@ -512,21 +546,33 @@ def rollup(session_id, transcript_path):
     cap = os.path.join(state, "capture", "%s.jsonl" % session_id)
     _atomic_write(cap, "".join(json.dumps(t, sort_keys=True) + "\n" for t in raw_turns))
     purge_old_captures(os.path.join(state, "capture"))
+    _debug("SessionEnd", session_id, "ok",
+           "prompts=%d tools=%d out=%d setup=%s"
+           % (metrics["prompts"], metrics["tool_calls_total"], metrics["tokens"]["output"],
+              "yes" if "setup" in metrics else "no"))
 
 
 def main():
     raw = sys.stdin.read()
-    if not _enabled():
-        return
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except Exception:
+        _debug("?", None, "bad-stdin")
         return
     event = payload.get("hook_event_name")
-    if event == "SessionStart":
-        write_fingerprint(payload)
-    elif event == "SessionEnd":
-        rollup(payload.get("session_id"), payload.get("transcript_path"))
+    sid = payload.get("session_id")
+    if not _enabled():
+        _debug(event, sid, "gated-off")   # logged even when off, to reveal that state
+        return
+    try:
+        if event == "SessionStart":
+            write_fingerprint(payload)
+        elif event == "SessionEnd":
+            rollup(sid, payload.get("transcript_path"))
+        else:
+            _debug(event, sid, "ignored-event")
+    except Exception as exc:
+        _debug(event, sid, "error", type(exc).__name__)   # type only — never the message
 
 
 if __name__ == "__main__":
