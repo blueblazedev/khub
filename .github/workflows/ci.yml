@@ -52,3 +52,5 @@ jobs:
           bash tests/telemetry/test_track_verbs.sh
           # SessionEnd rollup: transcript -> process metrics, fail-open, determinism
           bash tests/telemetry/test_capture_metrics.sh
+          # SessionStart setup fingerprint: harness detection, salted identity, join
+          bash tests/telemetry/test_fingerprint.sh

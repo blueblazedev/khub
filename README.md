@@ -124,6 +124,12 @@ opt-in, redacted export. Automation sessions (`sdk-ts`) are ignored.
 branch each turn ran on. `khub metrics --by-task` then totals **output tokens per
 ticket** across however many sessions the ticket took.
 
+**Setup fingerprint.** Each session is also tagged with the *setup* it ran under —
+harness (ClaudeKit vs vanilla), model, OS, skill/rule presence, a git-branch/repo id,
+and an optional cohort (`khub track enable --cohort internal|external`) — so you can
+compare ways of working. Identifying fields (repo id, skill names) are stored only as
+**salted hashes** using a random per-install key that never leaves your machine.
+
 A later release adds `khub export` (metrics-only by default) and `khub track purge`,
 plus a full privacy doc.
 
