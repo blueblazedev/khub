@@ -560,6 +560,7 @@ khub_lib_dir() {
 tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_hook_dir()    { printf '%s/khub-telemetry' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
 tel_hook_file()   { printf '%s/capture_hook.py' "$(tel_hook_dir)"; }
+tel_state_dir()   { printf '%s/khub-telemetry' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
 # Always exits 0 (prints the path, or nothing) so it is safe on an assignment RHS.
 tel_python3()     { command -v python3 2>/dev/null || true; }
 tel_settings_path() {  # <user|project>
@@ -789,6 +790,32 @@ cmd_track() {
   esac
 }
 
+# Show the most recent captured session's pre-rendered report (counts only — the
+# report carries no raw prompt/response text).
+cmd_metrics() {
+  local rdir; rdir="$(tel_state_dir)/report"
+  if [ ! -d "$rdir" ]; then
+    info "no telemetry captured yet"
+    hint "run 'khub track enable', then finish a Claude Code session"
+    return 0
+  fi
+  local f latest="" n=0
+  for f in "$rdir"/*.txt; do
+    [ -e "$f" ] || continue
+    n=$((n+1))
+    if [ -z "$latest" ] || [ "$f" -nt "$latest" ]; then latest="$f"; fi
+  done
+  if [ -z "$latest" ]; then
+    info "no telemetry reports yet"
+    hint "finish a Claude Code session with telemetry enabled"
+    return 0
+  fi
+  title "khub metrics — latest session"
+  cat "$latest"
+  detail "report:  $(tilde "$latest")"
+  detail "${n} session(s) captured in $(tilde "$rdir")"
+}
+
 usage() {
   cat <<EOF
 khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
@@ -809,6 +836,7 @@ usage:
                          opt-in, LOCAL-ONLY session telemetry (OFF by default)
                          (enable [--project] registers a hook in settings.json,
                           backing it up first; disable removes only khub's entries)
+  khub metrics           show the latest captured session's local report (counts only)
   khub help              this message
 
 Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.
@@ -828,6 +856,7 @@ main() {
     upgrade|self-update) cmd_upgrade "$@" ;;
     doctor)          cmd_doctor "$@" ;;
     track)           cmd_track "$@" ;;
+    metrics)         cmd_metrics "$@" ;;
     version|--version|-v) cmd_version "$@" ;;
     help|--help|-h)  usage ;;
     *)               printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;

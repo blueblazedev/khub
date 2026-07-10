@@ -31,6 +31,13 @@ run_track() { # <sandbox> <args...>
     KHUB_LIB_DIR="$repo_root/lib" \
     "$BASH_BIN" "$KHUB" track "$@"
 }
+run_khub() { # <sandbox> <verb...>   — any khub verb in the same sandbox
+  local sb="$1"; shift
+  NO_COLOR=1 HOME="$sb/home" \
+    XDG_CONFIG_HOME="$sb/config" XDG_DATA_HOME="$sb/data" XDG_STATE_HOME="$sb/state" \
+    KHUB_LIB_DIR="$repo_root/lib" \
+    "$BASH_BIN" "$KHUB" "$@"
+}
 settings_of() { printf '%s/home/.claude/settings.json' "$1"; }
 config_of()   { printf '%s/config/khub/telemetry.conf' "$1"; }
 hookfile_of() { printf '%s/data/khub-telemetry/capture_hook.py' "$1"; }
@@ -155,22 +162,26 @@ if [ "$tampered_flagged" -eq 1 ] && printf '%s' "$out2" | grep -qi 'integrity ve
 else _no "integrity: tamper/repair path broken" "$out"; fi
 rm -rf "$sb"
 
-# 8. the no-op hook FIRES on the registered stdin contract (proves the wire)
+# 8. END-TO-END wire: enable installs the hook; firing it on a transcript produces
+#    metrics; `khub metrics` surfaces them; and it stays gated once disabled.
 sb="$(new_sandbox)"; hk="$(hookfile_of "$sb")"
 run_track "$sb" enable >/dev/null 2>&1
-marker="$sb/state/khub-telemetry/last-fired"
-printf '{"hook_event_name":"SessionEnd","session_id":"sess-xyz"}' | \
+fixture="$repo_root/tests/telemetry/fixtures/session-cli.transcript.jsonl"
+printf '{"hook_event_name":"SessionEnd","session_id":"wire","transcript_path":"%s"}' "$fixture" | \
   XDG_CONFIG_HOME="$sb/config" XDG_STATE_HOME="$sb/state" "$PY" "$hk"; rc=$?
-if [ "$rc" -eq 0 ] && [ -f "$marker" ] && grep -q 'SessionEnd sess-xyz' "$marker"; then
-  _ok "hook fires: enabled hook writes a marker + exits 0"
-else _no "hook fires: no marker written (rc=$rc)"; fi
-# and with the enabled flag GONE (config absent) the same hook file is a silent
-# no-op, still exit 0 — gating lives in the hook, not just in registration.
-rm -f "$marker" "$(config_of "$sb")"
-printf '{"hook_event_name":"SessionEnd","session_id":"sess-2"}' | \
+if [ "$rc" -eq 0 ] && [ -f "$sb/state/khub-telemetry/metrics/wire.json" ]; then
+  _ok "wire: the installed hook turns a transcript into metrics, exit 0"
+else _no "wire: installed hook produced no metrics (rc=$rc)"; fi
+out="$(run_khub "$sb" metrics 2>&1)"
+if printf '%s' "$out" | grep -q 'prompts: 3'; then _ok "khub metrics: shows the latest session report"
+else _no "khub metrics: did not surface the report" "$out"; fi
+# gated: enabled flag gone => same hook writes nothing, still exit 0
+rm -f "$(config_of "$sb")"
+printf '{"hook_event_name":"SessionEnd","session_id":"gated","transcript_path":"%s"}' "$fixture" | \
   XDG_CONFIG_HOME="$sb/config" XDG_STATE_HOME="$sb/state" "$PY" "$hk" 2>/dev/null; rc=$?
-if [ "$rc" -eq 0 ] && [ ! -f "$marker" ]; then _ok "hook gated: no enabled config => hook writes nothing, exits 0"
-else _no "hook gated: fired while not enabled (rc=$rc)"; fi
+if [ "$rc" -eq 0 ] && [ ! -f "$sb/state/khub-telemetry/metrics/gated.json" ]; then
+  _ok "hook gated: no enabled config => no metrics, exit 0"
+else _no "hook gated: produced metrics while not enabled (rc=$rc)"; fi
 rm -rf "$sb"
 
 # ---------------------------------------------------------------------------

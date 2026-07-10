@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-07-10T09:00:00Z", "isMeta": false, "isSidechain": false, "entrypoint": "sdk-ts", "sessionId": "SID", "message": {"role": "user", "content": "automated task"}}
+{"type": "assistant", "timestamp": "2026-07-10T09:00:01Z", "entrypoint": "sdk-ts", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "R"}], "usage": {"input_tokens": 1, "output_tokens": 1}}}

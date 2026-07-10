@@ -48,3 +48,5 @@ jobs:
           bash tests/telemetry/test_settings_merge.sh
           # end-to-end `khub track` verbs in a sandboxed HOME/XDG
           bash tests/telemetry/test_track_verbs.sh
+          # SessionEnd rollup: transcript -> process metrics, fail-open, determinism
+          bash tests/telemetry/test_capture_metrics.sh

@@ -89,6 +89,7 @@ Point a code repo at the hub (writes a one-line pointer `CLAUDE.md`):
 | `khub doctor` | Diagnose auth, repo access, git-clone access, sibling layout, tampering, and snapshot freshness — each with a fix hint. |
 | `khub version` | Print the CLI version and the clone's latest snapshot (SHA + date). |
 | `khub track <enable\|disable\|status\|repair>` | Opt-in, **local-only** session telemetry (OFF by default). See below. |
+| `khub metrics` | Show the latest captured session's local report (counts only — no raw text). |
 
 ## Session telemetry (opt-in)
 
@@ -110,8 +111,15 @@ nothing ever leaves your machine.
 - `khub track repair` — reinstalls the hook and re-asserts registration if either
   drifted.
 
-Captured data stays under your local state dir; a later release adds `khub export`
-(metrics-only by default) and `khub track purge`, plus a full privacy doc.
+When a session ends, the hook reads that session's transcript and writes **process
+metrics** — prompt/turn counts, tool usage, token totals, edits, error→retry loops,
+subagents, session duration — to your local state dir. Run **`khub metrics`** to see
+the latest session's report. The metrics file holds **counts only, no raw prompt or
+response text**; a separate raw capture (also local) is kept briefly for a future
+opt-in, redacted export. Automation sessions (`sdk-ts`) are ignored.
+
+A later release adds `khub export` (metrics-only by default) and `khub track purge`,
+plus a full privacy doc.
 
 ## Pull-only policy
 
