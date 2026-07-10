@@ -88,6 +88,30 @@ Point a code repo at the hub (writes a one-line pointer `CLAUDE.md`):
 | `khub update` | Fast-forward the clone to the latest published snapshot. `--path DIR` to point at it; `--reset` to discard local changes (confirms first). |
 | `khub doctor` | Diagnose auth, repo access, git-clone access, sibling layout, tampering, and snapshot freshness — each with a fix hint. |
 | `khub version` | Print the CLI version and the clone's latest snapshot (SHA + date). |
+| `khub track <enable\|disable\|status\|repair>` | Opt-in, **local-only** session telemetry (OFF by default). See below. |
+
+## Session telemetry (opt-in)
+
+`khub track` is an **opt-in, local-first** way to measure your own ways of working
+across Claude Code sessions. It is **OFF until you run `khub track enable`**, and
+nothing ever leaves your machine.
+
+- `khub track enable` — after printing exactly what it does, it backs up your
+  `~/.claude/settings.json`, then **non-destructively** registers a small python3
+  hook under `SessionStart` + `SessionEnd`. Only khub's own entries are added
+  (identified by a marker, never by position), so any existing hooks are left
+  byte-for-byte intact. Requires `python3`; if it is missing, enable changes
+  nothing and tells you. Use `--project` to install into the current repo's
+  `.claude/settings.json` instead of user scope.
+- `khub track disable` — removes **only** khub's entries and the hook file; your
+  settings backups are kept.
+- `khub track status` — shows whether telemetry is enabled, whether the hook is
+  registered, and whether the hook file still matches what was installed.
+- `khub track repair` — reinstalls the hook and re-asserts registration if either
+  drifted.
+
+Captured data stays under your local state dir; a later release adds `khub export`
+(metrics-only by default) and `khub track purge`, plus a full privacy doc.
 
 ## Pull-only policy
 

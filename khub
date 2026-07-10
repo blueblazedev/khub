@@ -536,6 +536,259 @@ cmd_upgrade() {
     || die "upgrade failed" "re-run the install one-liner from the ${KHUB_REPO} README"
 }
 
+# ---- track (opt-in session telemetry) ---------------------------------------
+# khub distils a python3 dual-hook (SessionStart + SessionEnd) and NON-DESTRUCTIVELY
+# registers it in ~/.claude/settings.json at user scope, so it can measure "ways of
+# working" from real Claude Code sessions. LOCAL-FIRST, OFF by default, opt-in only.
+# All JSON work is delegated to lib/telemetry/settings_merge.py — this bash never
+# parses JSON. Every command-substitution below is guarded so `set -e` cannot abort
+# mid-mutation and leave a half-applied state.
+TELEMETRY_SCHEMA_VERSION=1
+
+# khub's own files, relative to the real script (dev/checkout layout). A single-file
+# install has no lib/ beside it — embedding lib/ as a release step is deferred; until
+# then telemetry runs from a full checkout or with KHUB_LIB_DIR set. Fails closed with
+# an actionable message when the helper is absent.
+khub_lib_dir() {
+  if [ -n "${KHUB_LIB_DIR:-}" ]; then printf '%s' "$KHUB_LIB_DIR"; return 0; fi
+  local self dir
+  self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"
+  if [ -L "$self" ]; then self="$(readlink "$self" 2>/dev/null || printf '%s' "$self")"; fi
+  dir="$(cd "$(dirname "$self")" >/dev/null 2>&1 && pwd)" || dir="."
+  printf '%s/lib' "$dir"
+}
+tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_hook_dir()    { printf '%s/khub-telemetry' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
+tel_hook_file()   { printf '%s/capture_hook.py' "$(tel_hook_dir)"; }
+# Always exits 0 (prints the path, or nothing) so it is safe on an assignment RHS.
+tel_python3()     { command -v python3 2>/dev/null || true; }
+tel_settings_path() {  # <user|project>
+  if [ "$1" = "project" ]; then printf '%s/.claude/settings.json' "$PWD"
+  else printf '%s/.claude/settings.json' "$HOME"; fi
+}
+# The registered command: ABSOLUTE interpreter + hook path (pinned at enable time so
+# a later PATH/venv change cannot 127 a session), guarded `|| exit 0` (fail-open).
+tel_hook_command() { printf "'%s' '%s' || exit 0" "$1" "$2"; }
+
+# Enterprise-managed settings OVERRIDE user settings, so a user-scope merge would be
+# silently overridden — detect the platform managed path and steer to project scope.
+tel_managed_present() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) [ -f "/Library/Application Support/ClaudeCode/managed-settings.json" ] ;;
+    *)      [ -f "/etc/claude-code/managed-settings.json" ] ;;
+  esac
+}
+
+# Read one key=value from the config; prints the value (possibly empty), returns 1 if
+# the key/file is absent so callers can `|| true` and default.
+tel_config_get() {  # <key>
+  local cfg line; cfg="$(tel_config_file)"
+  [ -f "$cfg" ] || return 1
+  line="$(grep -m1 "^$1=" "$cfg" 2>/dev/null)" || return 1
+  printf '%s' "${line#*=}"
+}
+
+# Run the JSON merge helper. Returns the helper's exit code (0 ok, 3 malformed,
+# 4 not-writable, 5 raced). Dies only if the helper file itself is missing.
+tel_merge() {  # <subcommand> <settings_path> [args...]
+  local lib py; lib="$(khub_lib_dir)/telemetry/settings_merge.py"
+  [ -f "$lib" ] || die "telemetry helper not found: $(tilde "$lib")" "run telemetry from a full khub checkout or set KHUB_LIB_DIR"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required for khub telemetry" "install python3, then re-run"
+  "$py" "$lib" "$@"
+}
+
+# Install (or reinstall) the hook file 0500 under a 0700 dir; print its sha256.
+# Returns 1 (message on stderr) on any failure so the caller can roll back.
+tel_install_hook() {
+  local src dir dst sha
+  src="$(khub_lib_dir)/telemetry/capture_hook.py"
+  [ -f "$src" ] || { printf 'telemetry hook source not found: %s\n' "$src" >&2; return 1; }
+  dir="$(tel_hook_dir)"; dst="$(tel_hook_file)"
+  mkdir -p "$dir" 2>/dev/null || { printf 'cannot create hook dir: %s\n' "$dir" >&2; return 1; }
+  chmod 700 "$dir" 2>/dev/null || true
+  rm -f "$dst" 2>/dev/null || true          # 0500 dest is unwritable; replace it
+  cp "$src" "$dst" || { printf 'cannot install hook file: %s\n' "$dst" >&2; return 1; }
+  chmod 500 "$dst" 2>/dev/null || true
+  sha="$(sha256_of "$dst")" || { printf 'no sha256 tool (shasum/sha256sum) available\n' >&2; return 1; }
+  printf '%s' "$sha"
+}
+
+# Write the config atomically (temp+rename, 0600). Values are paths/enums/hex — no
+# newlines — so printf is safe and no JSON is constructed in bash.
+tel_write_config() {  # <enabled> <sha> <python3> <scope> <settings_path>
+  local cfg dir tmp; cfg="$(tel_config_file)"; dir="$(dirname "$cfg")"
+  mkdir -p "$dir" 2>/dev/null || die "cannot create config dir: $(tilde "$dir")"
+  tmp="$(mktemp "$dir/.telemetry.XXXXXX")" || die "cannot write telemetry config"
+  {
+    printf 'enabled=%s\n' "$1"
+    printf 'schema_version=%s\n' "$TELEMETRY_SCHEMA_VERSION"
+    printf 'cohort=\n'
+    printf 'hook_sha256=%s\n' "$2"
+    printf 'python3=%s\n' "$3"
+    printf 'scope=%s\n' "$4"
+    printf 'settings_path=%s\n' "$5"
+  } > "$tmp" || { rm -f "$tmp"; die "cannot write telemetry config"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$cfg" || { rm -f "$tmp"; die "cannot finalize telemetry config"; }
+}
+
+track_notice() {
+  title "khub track enable — session telemetry (opt-in)"
+  say "Records LOCAL-ONLY, per-session process metrics from your Claude Code sessions"
+  say "(prompt/turn counts, tool usage, token totals, timings) to compare ways of working."
+  hint "captured to your machine only — nothing is sent anywhere"
+  hint "registers a hook in your Claude Code settings.json (backed up first)"
+  hint "disable + clean any time:  khub track disable"
+  say ""
+}
+
+track_enable() {
+  local scope="user"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) scope="project"; shift ;;
+      *) die "unknown option for track enable: $1" "try: khub track enable [--project]" ;;
+    esac
+  done
+
+  track_notice
+
+  # 1) python3 is REQUIRED — hard-fail, change nothing (no "enabled but capturing
+  #    nothing" half-state).
+  local py; py="$(tel_python3)"
+  [ -n "$py" ] || die "python3 is required for khub telemetry but was not found" \
+    "install python3, then re-run 'khub track enable' — nothing was changed"
+
+  # 2) managed user settings would silently override the merge — steer to project.
+  if [ "$scope" = "user" ] && tel_managed_present; then
+    die "this machine has enterprise-managed Claude Code settings (user scope would be overridden)" \
+      "run 'khub track enable --project' to install into this repo's .claude/settings.json instead"
+  fi
+
+  local settings; settings="$(tel_settings_path "$scope")"
+
+  # 3) install + fingerprint the hook (fallible work BEFORE any enabled flag).
+  local sha; sha="$(tel_install_hook)" || die "could not install the telemetry hook" "see the message above — nothing was enabled"
+
+  # 4) register in settings.json; roll the hook back on any failure.
+  local cmd rc=0; cmd="$(tel_hook_command "$py" "$(tel_hook_file)")"
+  tel_merge enable "$settings" --command "$cmd" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$(tel_hook_file)" 2>/dev/null || true
+    case "$rc" in
+      4) die "cannot write $(tilde "$settings")" "try 'khub track enable --project', or fix its permissions" ;;
+      3) die "$(tilde "$settings") is not valid JSON — refusing to touch it" "fix or move it, then re-run" ;;
+      5) die "$(tilde "$settings") changed while enabling — retry" "run 'khub track enable' again" ;;
+      *) die "could not register the telemetry hook (code $rc)" "run 'khub track status' to inspect" ;;
+    esac
+  fi
+
+  # 5) only now record the enabled flag — every fallible step above already passed.
+  tel_write_config 1 "$sha" "$py" "$scope" "$settings"
+
+  ok "telemetry enabled (${scope} scope)"
+  detail "settings: $(tilde "$settings")  (a backup was kept alongside)"
+  detail "hook:     $(tilde "$(tel_hook_file)")"
+  hint "check it:  khub track status"
+}
+
+track_disable() {
+  local scope settings rc=0
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+
+  tel_merge disable "$settings" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "could not cleanly unregister from $(tilde "$settings") (code $rc) — remove khub's entries by hand if needed"
+  fi
+  rm -f "$(tel_hook_file)" 2>/dev/null || true
+  rm -f "$(tel_config_file)" 2>/dev/null || true
+  rm -f "${settings}.khub-lock" 2>/dev/null || true   # persistent flock sibling
+  ok "telemetry disabled — hook unregistered and removed"
+  detail "settings.json backups are kept for safety (a later 'khub track purge' will remove them + the local store)"
+}
+
+track_status() {
+  local cfg; cfg="$(tel_config_file)"
+  title "khub track — telemetry status"
+  if [ ! -f "$cfg" ]; then
+    info "telemetry is OFF (not enabled)"
+    hint "enable with:  khub track enable"
+    return 0
+  fi
+
+  local enabled scope settings py hook sha_recorded
+  enabled="$(tel_config_get enabled || true)"
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+  py="$(tel_config_get python3 || true)"; [ -n "$py" ] || py="$(tel_python3)"
+  hook="$(tel_hook_file)"
+  sha_recorded="$(tel_config_get hook_sha256 || true)"
+
+  if [ "$enabled" = "1" ]; then ok "enabled (${scope} scope)"; else warn "config present but disabled"; fi
+  detail "settings: $(tilde "$settings")"
+
+  local st start end drift
+  st="$(tel_merge status "$settings" --command "$(tel_hook_command "$py" "$hook")" 2>/dev/null || true)"
+  start="$(printf '%s\n' "$st" | sed -n 's/^start=//p')"
+  end="$(printf '%s\n' "$st" | sed -n 's/^end=//p')"
+  drift="$(printf '%s\n' "$st" | sed -n 's/^drift=//p')"
+  if [ "$start" = "present" ] && [ "$end" = "present" ]; then
+    ok "hook registered (SessionStart + SessionEnd)"
+  else
+    bad "hook registration incomplete (start=${start:-?} end=${end:-?})"; hint "run 'khub track repair'"
+  fi
+
+  # hook-file integrity (F6): a tampered hook runs every session and is invisible to
+  # a presence-only check — recompute the digest and compare to the one from enable.
+  if [ -f "$hook" ]; then
+    local sha_now; sha_now="$(sha256_of "$hook" 2>/dev/null || true)"
+    if [ -n "$sha_recorded" ] && [ "$sha_now" = "$sha_recorded" ]; then
+      ok "hook file integrity verified"
+    elif [ -n "$sha_recorded" ]; then
+      bad "hook file digest changed since enable (tampering or drift)"; hint "run 'khub track repair'"
+    fi
+  else
+    bad "hook file missing: $(tilde "$hook")"; hint "run 'khub track repair'"
+  fi
+
+  case "$drift" in
+    none) : ;;
+    yes)  warn "hook command drift detected"; hint "run 'khub track repair'" ;;
+    *)    warn "could not read hook registration state" ;;
+  esac
+}
+
+track_repair() {
+  local cfg; cfg="$(tel_config_file)"
+  [ -f "$cfg" ] || die "telemetry is not enabled — nothing to repair" "run 'khub track enable'"
+  local scope settings py
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required but was not found" "install python3, then re-run"
+
+  # Rewrite the hook file (repairs a drifted/tampered/missing one) + refresh its sha,
+  # then re-assert registration. Single-shot — never loops, so a reverting managed
+  # settings.json cannot trigger a repair fight.
+  local sha; sha="$(tel_install_hook)" || die "could not reinstall the telemetry hook"
+  local cmd rc=0; cmd="$(tel_hook_command "$py" "$(tel_hook_file)")"
+  tel_merge enable "$settings" --command "$cmd" || rc=$?
+  [ "$rc" -eq 0 ] || die "could not re-register the telemetry hook (code $rc)" "run 'khub track status'"
+  tel_write_config 1 "$sha" "$py" "$scope" "$settings"
+  ok "telemetry repaired — hook reinstalled and re-registered"
+}
+
+cmd_track() {
+  local sub="${1:-status}"; if [ $# -gt 0 ]; then shift; fi
+  case "$sub" in
+    enable)  track_enable  "$@" ;;
+    disable) track_disable "$@" ;;
+    status)  track_status  "$@" ;;
+    repair)  track_repair  "$@" ;;
+    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
@@ -552,6 +805,10 @@ usage:
                          diagnose auth, access, sibling layout, and freshness
                          (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
+  khub track <enable|disable|status|repair>
+                         opt-in, LOCAL-ONLY session telemetry (OFF by default)
+                         (enable [--project] registers a hook in settings.json,
+                          backing it up first; disable removes only khub's entries)
   khub help              this message
 
 Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.
@@ -570,6 +827,7 @@ main() {
     update)          cmd_update "$@" ;;
     upgrade|self-update) cmd_upgrade "$@" ;;
     doctor)          cmd_doctor "$@" ;;
+    track)           cmd_track "$@" ;;
     version|--version|-v) cmd_version "$@" ;;
     help|--help|-h)  usage ;;
     *)               printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
