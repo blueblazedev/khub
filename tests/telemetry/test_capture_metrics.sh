@@ -131,6 +131,24 @@ if [ "$rc" -eq 0 ] && [ -f "$mj" ] && [ "$(mval "$mj" prompts)" = "1" ] \
 else _no "type-drift: malformed fields dropped the session (rc=$rc)"; fi
 rm -rf "$sb"
 
+# 9. token attribution: auto by git branch, then manual ticket override
+sb="$(sandbox)"; enable_cfg "$sb"
+fire "$sb" SessionEnd A1 "$FIX/session-cli.transcript.jsonl" >/dev/null 2>&1
+mj="$(metrics_json "$sb" A1)"
+if [ "$(mval "$mj" task)" = "feat/telemetry" ] \
+   && [ "$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["tokens_by_task"]["feat/telemetry"]["output"])' "$mj")" = "350" ]; then
+  _ok "attribution (auto): tokens booked to the git branch"
+else _no "attribution (auto): branch not used" "task=$(mval "$mj" task)"; fi
+# manual ticket overrides the branch
+printf 'TICKET-9\n' > "$sb/config/khub/telemetry-task"
+fire "$sb" SessionEnd A2 "$FIX/session-cli.transcript.jsonl" >/dev/null 2>&1
+mj="$(metrics_json "$sb" A2)"
+if [ "$(mval "$mj" task)" = "TICKET-9" ] \
+   && [ "$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["tokens_by_task"]["TICKET-9"]["output"])' "$mj")" = "350" ]; then
+  _ok "attribution (manual): ticket tag overrides the branch, books whole session"
+else _no "attribution (manual): ticket tag not honored" "task=$(mval "$mj" task)"; fi
+rm -rf "$sb"
+
 # ---------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

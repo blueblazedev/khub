@@ -184,6 +184,27 @@ if [ "$rc" -eq 0 ] && [ ! -f "$sb/state/khub-telemetry/metrics/gated.json" ]; th
 else _no "hook gated: produced metrics while not enabled (rc=$rc)"; fi
 rm -rf "$sb"
 
+# 9. `khub track task` + `khub metrics --by-task`: token accounting per ticket
+sb="$(new_sandbox)"; hk="$(hookfile_of "$sb")"; tf="$sb/config/khub/telemetry-task"
+run_track "$sb" enable >/dev/null 2>&1
+run_track "$sb" task "KHUB-1" >/dev/null 2>&1
+set_ok=0; [ -s "$tf" ] && [ "$(head -1 "$tf")" = "KHUB-1" ] && set_ok=1
+show="$(run_track "$sb" task 2>&1)"
+fixture="$repo_root/tests/telemetry/fixtures/session-cli.transcript.jsonl"
+printf '{"hook_event_name":"SessionEnd","session_id":"tk","transcript_path":"%s"}' "$fixture" | \
+  XDG_CONFIG_HOME="$sb/config" XDG_STATE_HOME="$sb/state" "$PY" "$hk" >/dev/null 2>&1
+tagged="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["task"])' "$sb/state/khub-telemetry/metrics/tk.json" 2>/dev/null)"
+by="$(run_khub "$sb" metrics --by-task 2>&1)"
+if [ "$set_ok" -eq 1 ] && printf '%s' "$show" | grep -q 'KHUB-1' \
+   && [ "$tagged" = "KHUB-1" ] && printf '%s' "$by" | grep -q 'KHUB-1' && printf '%s' "$by" | grep -q 'out 350'; then
+  _ok "track task: sets ticket, session books to it, metrics --by-task totals it"
+else _no "track task: attribution flow broke (set=$set_ok tagged=$tagged)" "$by"; fi
+# clear resets to branch attribution
+run_track "$sb" task --clear >/dev/null 2>&1
+if [ ! -f "$tf" ]; then _ok "track task --clear: removes the active ticket"
+else _no "track task --clear: task file remained"; fi
+rm -rf "$sb"
+
 # ---------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

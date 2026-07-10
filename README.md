@@ -88,8 +88,8 @@ Point a code repo at the hub (writes a one-line pointer `CLAUDE.md`):
 | `khub update` | Fast-forward the clone to the latest published snapshot. `--path DIR` to point at it; `--reset` to discard local changes (confirms first). |
 | `khub doctor` | Diagnose auth, repo access, git-clone access, sibling layout, tampering, and snapshot freshness — each with a fix hint. |
 | `khub version` | Print the CLI version and the clone's latest snapshot (SHA + date). |
-| `khub track <enable\|disable\|status\|repair>` | Opt-in, **local-only** session telemetry (OFF by default). See below. |
-| `khub metrics` | Show the latest captured session's local report (counts only — no raw text). |
+| `khub track <enable\|disable\|status\|repair\|task>` | Opt-in, **local-only** session telemetry (OFF by default). `task <id>` books tokens to a ticket. See below. |
+| `khub metrics [--by-task]` | Show the latest session's local report, or total output tokens per ticket across sessions. |
 
 ## Session telemetry (opt-in)
 
@@ -117,6 +117,12 @@ subagents, session duration — to your local state dir. Run **`khub metrics`** 
 the latest session's report. The metrics file holds **counts only, no raw prompt or
 response text**; a separate raw capture (also local) is kept briefly for a future
 opt-in, redacted export. Automation sessions (`sdk-ts`) are ignored.
+
+**Tokens per ticket.** To measure how many tokens a task/ticket cost, tag your work:
+`khub track task <ticket-id>` books every following session's tokens to that ticket
+(clear with `khub track task --clear`). With no tag set, tokens attribute to the git
+branch each turn ran on. `khub metrics --by-task` then totals **output tokens per
+ticket** across however many sessions the ticket took.
 
 A later release adds `khub export` (metrics-only by default) and `khub track purge`,
 plus a full privacy doc.

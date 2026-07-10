@@ -558,6 +558,7 @@ khub_lib_dir() {
   printf '%s/lib' "$dir"
 }
 tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_task_file()   { printf '%s/khub/telemetry-task' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_hook_dir()    { printf '%s/khub-telemetry' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
 tel_hook_file()   { printf '%s/capture_hook.py' "$(tel_hook_dir)"; }
 tel_state_dir()   { printf '%s/khub-telemetry' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
@@ -704,6 +705,7 @@ track_disable() {
   fi
   rm -f "$(tel_hook_file)" 2>/dev/null || true
   rm -f "$(tel_config_file)" 2>/dev/null || true
+  rm -f "$(tel_task_file)" 2>/dev/null || true
   rm -f "${settings}.khub-lock" 2>/dev/null || true   # persistent flock sibling
   ok "telemetry disabled — hook unregistered and removed"
   detail "settings.json backups are kept for safety (a later 'khub track purge' will remove them + the local store)"
@@ -779,6 +781,32 @@ track_repair() {
   ok "telemetry repaired — hook reinstalled and re-registered"
 }
 
+# Set/clear/show the active ticket that sessions book their tokens to. Stored in
+# its own file so enable/disable/repair (which rewrite telemetry.conf) never touch it.
+track_task() {
+  local tf; tf="$(tel_task_file)"
+  if [ $# -eq 0 ]; then
+    if [ -s "$tf" ]; then info "active task: $(head -1 "$tf" 2>/dev/null)"
+    else info "active task: none (tokens attribute by git branch)"; hint "set one:  khub track task <ticket-id>"; fi
+    return 0
+  fi
+  case "$1" in
+    --clear|clear)
+      rm -f "$tf" 2>/dev/null || true
+      ok "active task cleared — tokens now attribute by git branch"
+      return 0 ;;
+  esac
+  local id="$1"
+  case "$id" in *[!A-Za-z0-9._/#-]*) die "invalid task id: $id" "allowed: letters, digits, and . _ / # -" ;; esac
+  [ "${#id}" -le 64 ] || die "task id too long (max 64 chars)"
+  mkdir -p "$(dirname "$tf")" 2>/dev/null || die "cannot create config dir"
+  printf '%s\n' "$id" > "$tf" || die "cannot write the task file"
+  chmod 600 "$tf" 2>/dev/null || true
+  ok "active task set: $id"
+  detail "sessions will book their tokens to '$id' until you change or clear it"
+  hint "totals so far:  khub metrics --by-task"
+}
+
 cmd_track() {
   local sub="${1:-status}"; if [ $# -gt 0 ]; then shift; fi
   case "$sub" in
@@ -786,13 +814,32 @@ cmd_track() {
     disable) track_disable "$@" ;;
     status)  track_status  "$@" ;;
     repair)  track_repair  "$@" ;;
-    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair" ;;
+    task)    track_task    "$@" ;;
+    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task" ;;
   esac
 }
 
 # Show the most recent captured session's pre-rendered report (counts only — the
-# report carries no raw prompt/response text).
+# report carries no raw prompt/response text). `--by-task` totals output tokens per
+# ticket across ALL captured sessions instead.
 cmd_metrics() {
+  local by_task=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by-task) by_task=1; shift ;;
+      *) die "unknown option for metrics: $1" "try: khub metrics [--by-task]" ;;
+    esac
+  done
+  if [ "$by_task" = "1" ]; then
+    local mdir lib py; mdir="$(tel_state_dir)/metrics"
+    if [ ! -d "$mdir" ]; then info "no telemetry captured yet"; hint "run 'khub track enable', then finish a session"; return 0; fi
+    lib="$(khub_lib_dir)/telemetry/aggregate_tasks.py"
+    [ -f "$lib" ] || die "telemetry helper not found: $(tilde "$lib")" "run from a full khub checkout or set KHUB_LIB_DIR"
+    py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required" "install python3"
+    title "khub metrics — output tokens by task"
+    "$py" "$lib" "$mdir"
+    return 0
+  fi
   local rdir; rdir="$(tel_state_dir)/report"
   if [ ! -d "$rdir" ]; then
     info "no telemetry captured yet"
@@ -832,11 +879,14 @@ usage:
                          diagnose auth, access, sibling layout, and freshness
                          (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
-  khub track <enable|disable|status|repair>
+  khub track <enable|disable|status|repair|task>
                          opt-in, LOCAL-ONLY session telemetry (OFF by default)
                          (enable [--project] registers a hook in settings.json,
-                          backing it up first; disable removes only khub's entries)
-  khub metrics           show the latest captured session's local report (counts only)
+                          backing it up first; disable removes only khub's entries;
+                          task <id> books sessions' tokens to a ticket, --clear resets)
+  khub metrics [--by-task]
+                         show the latest session's local report (counts only), or
+                         --by-task to total output tokens per ticket across sessions
   khub help              this message
 
 Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.

@@ -59,6 +59,22 @@ def _enabled():
     return False
 
 
+def _task_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "khub", "telemetry-task")
+
+
+def _active_task():
+    """The manually-set ticket id (`khub track task <id>`), or None to fall back to
+    git-branch attribution."""
+    try:
+        with open(_task_path(), encoding="utf-8") as fh:
+            t = fh.readline().strip()
+            return t or None
+    except Exception:
+        return None
+
+
 # ---- transcript helpers -----------------------------------------------------
 def _text_of(content):
     if isinstance(content, str):
@@ -96,14 +112,23 @@ def _blocks(msg):
     return c if isinstance(c, list) else []
 
 
-def parse_transcript(path):
+def _zero_tokens():
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+
+
+def parse_transcript(path, manual_task=None):
     """Single streaming pass → (metrics dict, entrypoint, raw_turns). Parsed
     defensively: an unparseable line is skipped, and each field is read with a safe
     fallback (non-numeric tokens → 0, non-string keys → "unknown"/"?"), so a future
     transcript-schema drift degrades gracefully instead of dropping the whole
-    session's metrics."""
+    session's metrics.
+
+    Token attribution: if manual_task is set (`khub track task <id>`) the whole
+    session's tokens are booked to that ticket; otherwise they are split by the
+    git branch each turn ran on (one-branch-per-ticket workflows get this free)."""
     tool_calls = {}
     tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    tokens_by_branch = {}           # gitBranch -> token dict (for auto attribution)
     edits = {}                      # file_path -> count
     prompts = 0
     slash = 0
@@ -147,10 +172,21 @@ def parse_transcript(path):
             if t == "assistant" and isinstance(msg, dict):
                 usage = msg.get("usage")
                 if isinstance(usage, dict):
-                    tokens["input"] += _num(usage.get("input_tokens"))
-                    tokens["output"] += _num(usage.get("output_tokens"))
-                    tokens["cache_read"] += _num(usage.get("cache_read_input_tokens"))
-                    tokens["cache_creation"] += _num(usage.get("cache_creation_input_tokens"))
+                    ui = _num(usage.get("input_tokens"))
+                    uo = _num(usage.get("output_tokens"))
+                    ur = _num(usage.get("cache_read_input_tokens"))
+                    uc = _num(usage.get("cache_creation_input_tokens"))
+                    tokens["input"] += ui
+                    tokens["output"] += uo
+                    tokens["cache_read"] += ur
+                    tokens["cache_creation"] += uc
+                    br = obj.get("gitBranch")
+                    br = br if isinstance(br, str) and br else "unknown"
+                    bt = tokens_by_branch.setdefault(br, _zero_tokens())
+                    bt["input"] += ui
+                    bt["output"] += uo
+                    bt["cache_read"] += ur
+                    bt["cache_creation"] += uc
                 for b in _blocks(msg):
                     if not isinstance(b, dict):
                         continue
@@ -203,12 +239,25 @@ def parse_transcript(path):
     distinct = len(edits)
     reworked = sum(1 for n in edits.values() if n >= REWORK_MIN)
     duration = int(round((ts_max - ts_min))) if (ts_min is not None and ts_max is not None) else 0
+    # Token attribution → per ticket. Manual tag books the whole session to that
+    # ticket; otherwise split by git branch (the dominant branch names the session).
+    if manual_task:
+        task = manual_task
+        tokens_by_task = {manual_task: dict(tokens)}
+    elif tokens_by_branch:
+        tokens_by_task = tokens_by_branch
+        task = max(tokens_by_branch, key=lambda b: tokens_by_branch[b]["output"])
+    else:
+        task = "unknown"
+        tokens_by_task = {}
     metrics = {
         "schema_version": SCHEMA_VERSION,
         "entrypoint": entrypoint or "unknown",
         "duration_seconds": duration,
         "prompts": prompts,
         "turns": prompts,
+        "task": task,
+        "tokens_by_task": tokens_by_task,
         "tool_calls_total": sum(tool_calls.values()),
         "tool_calls": tool_calls,
         "tokens": tokens,
@@ -239,6 +288,7 @@ def render_report(session_id, m):
     tk = m["tokens"]
     lines = [
         "khub telemetry — session %s" % session_id,
+        "task: %s · output tokens: %d" % (m.get("task", "unknown"), tk["output"]),
         "entrypoint: %s · duration: %ds · prompts: %d · turns: %d"
         % (m["entrypoint"], m["duration_seconds"], m["prompts"], m["turns"]),
         "tools: %d total (%s)" % (m["tool_calls_total"], tc or "none"),
@@ -289,7 +339,7 @@ def purge_old_captures(cap_dir):
 def rollup(session_id, transcript_path):
     if not session_id or not transcript_path or not os.path.isfile(transcript_path):
         return
-    metrics, entrypoint, raw_turns = parse_transcript(transcript_path)
+    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
     if entrypoint in DROP_ENTRYPOINTS:
         return                       # automation surface — excluded from the population
     metrics["session_id"] = session_id
