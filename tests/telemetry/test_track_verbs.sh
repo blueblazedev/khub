@@ -205,6 +205,25 @@ if [ ! -f "$tf" ]; then _ok "track task --clear: removes the active ticket"
 else _no "track task --clear: task file remained"; fi
 rm -rf "$sb"
 
+# 10. self-contained: with NO on-disk lib/ (empty KHUB_LIB_DIR) the EMBEDDED helpers
+#     drive enable + capture — proves the single-file install works from any folder.
+sb="$(new_sandbox)"; el="$(mktemp -d "${TMPDIR:-/tmp}/khub-nolib.XXXXXX")"
+emb() { NO_COLOR=1 HOME="$sb/home" XDG_CONFIG_HOME="$sb/config" XDG_DATA_HOME="$sb/data" \
+  XDG_STATE_HOME="$sb/state" KHUB_LIB_DIR="$el" "$BASH_BIN" "$KHUB" "$@"; }
+emb track enable >/dev/null 2>&1; rc=$?
+hk="$(hookfile_of "$sb")"
+if [ "$rc" -eq 0 ] && [ -f "$hk" ] && [ -f "$(settings_of "$sb")" ] \
+   && diff -q "$hk" "$repo_root/lib/telemetry/capture_hook.py" >/dev/null; then
+  # and capture works through the embedded-installed hook
+  printf '{"hook_event_name":"SessionEnd","session_id":"emb","transcript_path":"%s"}' \
+    "$repo_root/tests/telemetry/fixtures/session-cli.transcript.jsonl" | \
+    XDG_CONFIG_HOME="$sb/config" XDG_STATE_HOME="$sb/state" "$PY" "$hk" >/dev/null 2>&1
+  if [ -f "$sb/state/khub-telemetry/metrics/emb.json" ]; then
+    _ok "self-contained: embedded helpers enable + capture with no lib/ (hook matches source)"
+  else _no "self-contained: embedded hook produced no metrics"; fi
+else _no "self-contained: embedded enable failed or hook drifted (rc=$rc)"; fi
+rm -rf "$sb" "$el"
+
 # ---------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

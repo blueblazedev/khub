@@ -44,6 +44,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 --version
+          # the helpers embedded in `khub` must match lib/telemetry/*.py (no drift)
+          bash scripts/check-embedded-telemetry.sh
           # settings.json merge/unmerge/status correctness + non-destruction
           bash tests/telemetry/test_settings_merge.sh
           # end-to-end `khub track` verbs in a sandboxed HOME/XDG
