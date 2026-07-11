@@ -56,3 +56,5 @@ jobs:
           bash tests/telemetry/test_fingerprint.sh
           # opt-in debug log + redacted `track doctor` diagnostic
           bash tests/telemetry/test_debug_doctor.sh
+          # export bundling + redaction (grep-proof metrics, snippet scrub, external gate)
+          bash tests/telemetry/test_export_redaction.sh

@@ -88,8 +88,9 @@ Point a code repo at the hub (writes a one-line pointer `CLAUDE.md`):
 | `khub update` | Fast-forward the clone to the latest published snapshot. `--path DIR` to point at it; `--reset` to discard local changes (confirms first). |
 | `khub doctor` | Diagnose auth, repo access, git-clone access, sibling layout, tampering, and snapshot freshness — each with a fix hint. |
 | `khub version` | Print the CLI version and the clone's latest snapshot (SHA + date). |
-| `khub track <enable\|disable\|status\|repair\|task>` | Opt-in, **local-only** session telemetry (OFF by default). `task <id>` books tokens to a ticket. See below. |
+| `khub track <enable\|disable\|status\|repair\|task\|debug\|doctor\|purge>` | Opt-in, **local-only** session telemetry (OFF by default). `task <id>` books tokens to a ticket; `purge` deletes everything. See below. |
 | `khub metrics [--by-task]` | Show the latest session's local report, or total output tokens per ticket across sessions. |
+| `khub export [--with-snippets]` | Write a **redacted, review-before-send** bundle of the metrics (metrics-only + grep-proof by default). Never uploads. |
 
 ## Session telemetry (opt-in)
 
@@ -137,6 +138,13 @@ debug on`, reproduce a session, then run **`khub track doctor`** — a **redacte
 paste-ready** report (config, hook registration, integrity, store counts, and the last
 debug lines; `$HOME`→`~`, no prompts/paths/skill names). Safe to share for support or
 for an agent to self-diagnose. `khub track debug off` stops it.
+
+**Sharing + privacy.** `khub export` writes a redacted, **metrics-only** bundle you
+review before sending — nothing is uploaded; `--with-snippets` adds secret-scrubbed
+prompt/response text. External-cohort export is **hard-blocked in code** without a
+data-owner DPA token. `khub track purge` deletes all local data + config + settings
+backups. Full details — exactly what's collected, what can leave, how to disable and
+purge — are in **[docs/telemetry-privacy.md](docs/telemetry-privacy.md)**.
 
 A later release adds `khub export` (metrics-only by default) and `khub track purge`,
 plus a full privacy doc.

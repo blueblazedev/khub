@@ -572,6 +572,7 @@ tel_prepare() {
   _khub_py_settings_merge  > "$_KHUB_EMBED_DIR/settings_merge.py"  || die "cannot write the telemetry helper"
   _khub_py_capture_hook    > "$_KHUB_EMBED_DIR/capture_hook.py"    || die "cannot write the telemetry helper"
   _khub_py_aggregate_tasks > "$_KHUB_EMBED_DIR/aggregate_tasks.py" || die "cannot write the telemetry helper"
+  _khub_py_export_redact   > "$_KHUB_EMBED_DIR/export_redact.py"   || die "cannot write the telemetry helper"
 }
 
 # Return a runnable path to a helper: the on-disk lib/ file if present (dev/checkout),
@@ -585,6 +586,7 @@ tel_task_file()   { printf '%s/khub/telemetry-task' "${XDG_CONFIG_HOME:-$HOME/.c
 tel_salt_file()   { printf '%s/khub/telemetry-salt' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_cohort_file() { printf '%s/khub/telemetry-cohort' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 tel_debug_file()  { printf '%s/khub/telemetry-debug' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_dpa_token_file() { printf '%s/khub/telemetry-dpa-token' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 # count directory entries without `ls | wc` (SC2012-clean, glob-safe)
 tel_count() { local n=0 f; for f in "$1"/*; do [ -e "$f" ] && n=$((n+1)); done; printf '%d' "$n"; }
 # A per-install random salt, generated ONCE and kept stable, so the fingerprint's
@@ -678,6 +680,7 @@ track_notice() {
   say "(prompt/turn counts, tool usage, token totals, timings) to compare ways of working."
   hint "captured to your machine only — nothing is sent anywhere"
   hint "registers a hook in your Claude Code settings.json (backed up first)"
+  hint "what's collected + how to purge:  docs/telemetry-privacy.md"
   hint "disable + clean any time:  khub track disable"
   say ""
 }
@@ -907,6 +910,20 @@ track_doctor() {
   } | redact
 }
 
+# Delete ALL local telemetry — data store, config, hook, AND settings.json backups
+# (they hold the full tool config). Confirms first.
+track_purge() {
+  local settings; settings="$(tel_config_get settings_path 2>/dev/null || true)"
+  [ -n "$settings" ] || settings="$(tel_settings_path "$(tel_config_get scope 2>/dev/null || echo user)")"
+  printf '%s%s%s This DELETES all local telemetry — captures, metrics, reports, fingerprints, the\n' "$c_ylw" "$g_warn" "$c_reset"
+  printf '   debug log, khub'"'"'s hook + config, AND khub'"'"'s settings.json backups. Continue? [y/N] '
+  read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
+  track_disable >/dev/null 2>&1 || true                 # unregister hook + remove config/salt/cohort
+  rm -rf "$(tel_state_dir)" 2>/dev/null || true         # the whole local data store
+  rm -f "${settings}".khub-bak-* 2>/dev/null || true    # backups hold the full tool config
+  ok "telemetry purged — hook removed, all local data + settings backups deleted"
+}
+
 cmd_track() {
   tel_prepare   # parent-scope: make embedded helpers available to the subshells below
   local sub="${1:-status}"; if [ $# -gt 0 ]; then shift; fi
@@ -918,7 +935,49 @@ cmd_track() {
     task)    track_task    "$@" ;;
     debug)   track_debug   "$@" ;;
     doctor)  track_doctor  "$@" ;;
-    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task|debug|doctor" ;;
+    purge)   track_purge   "$@" ;;
+    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task|debug|doctor|purge" ;;
+  esac
+}
+
+# Package the setup-tagged metrics for sharing — metrics-only by default (grep-proof),
+# opt-in redacted snippets. Writes a local bundle to REVIEW; never uploads.
+cmd_export() {
+  local with_snippets=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-snippets) with_snippets=1; shift ;;
+      *) die "unknown option for export: $1" "try: khub export [--with-snippets]" ;;
+    esac
+  done
+  tel_prepare
+  local sd; sd="$(tel_state_dir)"
+  if [ ! -d "$sd/metrics" ]; then info "no telemetry to export yet"; hint "run 'khub track enable', finish a session, then export"; return 0; fi
+  local lib py; lib="$(tel_helper export_redact.py)" || die "could not materialize the telemetry helper" "reinstall khub"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required" "install python3"
+  local cohort salt login ts out
+  cohort="$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)"
+  salt="$([ -s "$(tel_salt_file)" ] && head -1 "$(tel_salt_file)" || echo '')"
+  login="$(gh api user -q .login 2>/dev/null || true)"
+  ts="$(date +%Y%m%d-%H%M%S)"; out="$sd/export/$ts"
+  set -- --state "$sd" --out "$out" --cohort "$cohort" --home "$HOME"
+  [ -n "$salt" ] && set -- "$@" --salt "$salt"
+  [ -n "$login" ] && set -- "$@" --login "$login"
+  [ "$with_snippets" = "1" ] && set -- "$@" --with-snippets
+  if [ "$cohort" = "external" ]; then
+    set -- "$@" --dpa-token "$(tel_dpa_token_file)"
+    [ "$with_snippets" = "1" ] && set -- "$@" --exclude-tool-bodies   # default ON for external
+  fi
+  local rc=0; "$py" "$lib" "$@" || rc=$?
+  local extra=""; [ "$with_snippets" = "1" ] && extra=" + redacted snippets"
+  case "$rc" in
+    0) title "khub export"
+       ok "bundle written (metrics-only${extra})"
+       detail "$(tilde "$out")"
+       hint "REVIEW it before sharing — nothing was sent anywhere" ;;
+    6) die "external-cohort export is BLOCKED — no DPA consent token" \
+         "a named DPA owner must provision $(tilde "$(tel_dpa_token_file)") first" ;;
+    *) die "export failed (code $rc)" "run 'khub track doctor'" ;;
   esac
 }
 
@@ -993,15 +1052,20 @@ usage:
                          diagnose auth, access, sibling layout, and freshness
                          (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
-  khub track <enable|disable|status|repair|task|debug|doctor>
+  khub track <enable|disable|status|repair|task|debug|doctor|purge>
                          opt-in, LOCAL-ONLY session telemetry (OFF by default)
                          (enable [--project] [--cohort internal|external] registers a
                           hook in settings.json, backing it up first; disable removes
                           only khub's entries; task <id> books tokens to a ticket;
-                          debug on|off toggles a log; doctor prints a redacted report)
+                          debug on|off toggles a log; doctor prints a redacted report;
+                          purge deletes all local data + config + settings backups)
   khub metrics [--by-task]
                          show the latest session's local report (counts only), or
                          --by-task to total output tokens per ticket across sessions
+  khub export [--with-snippets]
+                         write a redacted, review-before-send bundle of the metrics
+                         (metrics-only + grep-proof by default; --with-snippets adds
+                          redacted prompt/response text). Nothing is ever uploaded.
   khub help              this message
 
 Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.
@@ -2050,6 +2114,199 @@ if __name__ == "__main__":
         pass
 KHUB_EMBEDDED_PY_EOF
 }
+_khub_py_export_redact() {
+cat <<'KHUB_EMBEDDED_PY_EOF'
+#!/usr/bin/env python3
+"""khub telemetry export + redaction.
+
+Package setup-tagged metrics for sharing WITHOUT leaking. Two safety tiers:
+
+  * DEFAULT (metrics only): an ALLOWLIST of known-safe fields — counts, a public
+    model id, and the already-salted setup fingerprint. Unrecognised fields are
+    dropped (fail-closed), `mcp__…` tool names are hashed (they reveal a client's
+    installed toolchain), and for the EXTERNAL cohort task/branch labels are hashed
+    too. Every string leaf is still run through the secret scrubber as defence in
+    depth. Result is grep-proof: no raw prompt/response text, no $HOME, no login, no
+    raw repo id, no secret.
+  * --with-snippets (opt-in, high-touch): raw prompt/response text from the local
+    capture, run through the scrubber ($HOME→~, login→<user>, and a secret-pattern
+    inventory). Fail-closed: a line that can't be processed is skipped.
+
+The EXTERNAL cohort is HARD-BLOCKED without an org-provisioned DPA consent token —
+export refuses to run (exit 6). This contradicts khub's pull-only trust model on
+purpose and needs a named owner's sign-off; the token is that machine-enforced gate.
+
+Nothing is ever uploaded — the bundle is written locally for the engineer to review.
+"""
+import argparse
+import glob
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_EXTERNAL_BLOCKED = 6
+
+# Only these top-level metric fields are ever exported; anything else is dropped.
+SAFE_TOP = (
+    "schema_version", "session_id", "entrypoint", "duration_seconds", "prompts",
+    "turns", "model", "tool_calls_total", "tool_calls", "tokens", "edits",
+    "error_retries", "subagents", "slash_commands", "user_corrections", "task",
+    "tokens_by_task", "setup",
+)
+
+SECRET_PATTERNS = [
+    ("gh-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("openai-key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("aws-key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("pem", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("url-creds", re.compile(r"://[^/@\s:]+:[^/@\s]+@")),
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("secret-assign", re.compile(r"\b[A-Z][A-Z0-9_]{2,}=[^\s\"']{8,}")),
+]
+# Collapse a home-directory path shape even when it is not the runtime $HOME (F8:
+# a client home /Users/alice/… must not leak just because CI's $HOME differs).
+_HOME_SHAPE = re.compile(r"/(Users|home)/[^/\s\"']+")
+
+
+def scrub_text(s, home, login):
+    if not isinstance(s, str):
+        return s
+    if home:
+        s = s.replace(home, "~")
+    s = _HOME_SHAPE.sub(r"/\1/<user>", s)
+    if login:
+        s = s.replace(login, "<user>")
+    for name, pat in SECRET_PATTERNS:
+        s = pat.sub("<redacted:%s>" % name, s)
+    return s
+
+
+def _hash(salt, value):
+    try:
+        key = bytes.fromhex(salt) if salt else b"khub"
+    except ValueError:
+        key = (salt or "khub").encode("utf-8")
+    return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+
+
+def _scrub_obj(obj, home, login):
+    if isinstance(obj, dict):
+        return {k: _scrub_obj(v, home, login) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_obj(v, home, login) for v in obj]
+    return scrub_text(obj, home, login)
+
+
+def sanitize_metrics(rec, cohort, salt, home, login):
+    if not isinstance(rec, dict):
+        return None
+    out = {k: rec[k] for k in SAFE_TOP if k in rec}
+    # mcp/plugin tool names identify a client's toolchain — hash them (keep counts)
+    tc = out.get("tool_calls")
+    if isinstance(tc, dict):
+        out["tool_calls"] = {
+            ("mcp:%s" % _hash(salt, k) if isinstance(k, str) and k.startswith("mcp__") else k): v
+            for k, v in tc.items()
+        }
+    # external cohort: task/branch labels can identify — hash them
+    if cohort == "external":
+        if isinstance(out.get("task"), str):
+            out["task"] = "task:%s" % _hash(salt, out["task"])
+        tbt = out.get("tokens_by_task")
+        if isinstance(tbt, dict):
+            out["tokens_by_task"] = {("task:%s" % _hash(salt, k)): v for k, v in tbt.items()}
+    return _scrub_obj(out, home, login)
+
+
+def build_bundle(args):
+    cohort = args.cohort or "unset"
+    if cohort == "external":
+        tok = args.dpa_token
+        if not (tok and os.path.isfile(tok) and os.path.getsize(tok) > 0):
+            sys.stderr.write(
+                "external-cohort export is BLOCKED: no DPA consent token.\n"
+                "  a named DPA owner must provision the token file before external export can run.\n"
+            )
+            return EXIT_EXTERNAL_BLOCKED
+
+    os.makedirs(args.out, exist_ok=True)
+    recs = []
+    for path in sorted(glob.glob(os.path.join(args.state, "metrics", "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except Exception:
+            continue
+        san = sanitize_metrics(rec, cohort, args.salt, args.home, args.login)
+        if san is not None:
+            recs.append(san)
+    with open(os.path.join(args.out, "metrics.ndjson"), "w", encoding="utf-8") as fh:
+        for r in recs:
+            fh.write(json.dumps(r, sort_keys=True) + "\n")
+
+    snippet_count = 0
+    if args.with_snippets:
+        with open(os.path.join(args.out, "snippets.redacted.ndjson"), "w", encoding="utf-8") as out:
+            for path in sorted(glob.glob(os.path.join(args.state, "capture", "*.jsonl"))):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            turn = json.loads(line)
+                            snip = {
+                                "prompt": scrub_text(turn.get("prompt", ""), args.home, args.login),
+                                "tools": turn.get("tools", []),
+                            }
+                            # responses can echo client code — drop them for external
+                            if not args.exclude_tool_bodies:
+                                snip["response"] = scrub_text(turn.get("response", ""), args.home, args.login)
+                            out.write(json.dumps(snip, sort_keys=True) + "\n")
+                            snippet_count += 1
+                except Exception:
+                    continue
+
+    manifest = {
+        "schema_version": 1,
+        "session_count": len(recs),
+        "cohort": cohort,
+        "includes_snippets": bool(args.with_snippets),
+        "snippet_count": snippet_count,
+        "consent": {"opt_in": True, "cohort": cohort,
+                    "dpa_token": bool(cohort == "external" and args.dpa_token)},
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, sort_keys=True, indent=2)
+        fh.write("\n")
+    return EXIT_OK
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="export_redact.py")
+    p.add_argument("--state", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--cohort", default="unset")
+    p.add_argument("--dpa-token", dest="dpa_token", default=None)
+    p.add_argument("--salt", default="")
+    p.add_argument("--home", default=None)
+    p.add_argument("--login", default=None)
+    p.add_argument("--with-snippets", dest="with_snippets", action="store_true")
+    p.add_argument("--exclude-tool-bodies", dest="exclude_tool_bodies", action="store_true")
+    args = p.parse_args(argv)
+    return build_bundle(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+KHUB_EMBEDDED_PY_EOF
+}
 # <<< END embedded telemetry helpers <<<
 
 # ---- dispatch ---------------------------------------------------------------
@@ -2062,6 +2319,7 @@ main() {
     doctor)          cmd_doctor "$@" ;;
     track)           cmd_track "$@" ;;
     metrics)         cmd_metrics "$@" ;;
+    export)          cmd_export "$@" ;;
     version|--version|-v) cmd_version "$@" ;;
     help|--help|-h)  usage ;;
     *)               printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
