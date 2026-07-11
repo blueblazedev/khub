@@ -21,7 +21,9 @@
 set -uo pipefail
 
 tree="${1:-}"
-[ -n "$tree" ] && [ -d "$tree" ] || { echo "usage: brand-verify.sh <branded-tree>" >&2; exit 2; }
+if [ -z "$tree" ] || [ ! -d "$tree" ]; then
+  echo "usage: brand-verify.sh <branded-tree>" >&2; exit 2
+fi
 tree="$(cd "$tree" && pwd)"
 PY="$(command -v python3 || true)"
 [ -n "$PY" ] || { echo "brand-verify: python3 is required" >&2; exit 2; }
@@ -36,7 +38,7 @@ trap 'rm -rf "$work"' EXIT
 cli=""
 n_exec=0
 for f in "$tree"/* "$tree"/.[!.]*; do
-  [ -f "$f" ] && [ -x "$f" ] || continue
+  if [ ! -f "$f" ] || [ ! -x "$f" ]; then continue; fi
   n_exec=$((n_exec+1)); cli="$f"
 done
 [ "$n_exec" -eq 1 ] || fail modebits "expected exactly 1 executable at the tree root, found $n_exec (the CLI must keep 0755)"

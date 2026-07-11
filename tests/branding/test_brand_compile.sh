@@ -230,7 +230,7 @@ if [ -f "$mf" ]; then
   case "$src_rev" in *[!0-9a-f]*|'') g9=1 ;; esac
   [ "${#src_rev}" -eq 64 ] || g9=1
   [ -n "$head_sha" ] && [ "$src_rev" = "$head_sha" ] && g9=1
-  [ -n "$conf_rev" ] && [ -n "$comp_rev" ] || g9=1
+  if [ -z "$conf_rev" ] || [ -z "$comp_rev" ]; then g9=1; fi
   # not just HMAC-shaped: recompute HMAC(key, HEAD) and demand an exact match
   if [ -n "$head_sha" ]; then
     want_src="$("$PY" -c 'import hmac,hashlib,sys
