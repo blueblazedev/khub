@@ -3,13 +3,17 @@ set -euo pipefail
 # =============================================================================
 # khub — clone and keep a delivered knowledge-hub snapshot current, as a sibling
 # of your code repos. Interface only: it talks to the private client repo using
-# YOUR existing `gh` auth. Dependencies: git + gh (nothing else).
+# YOUR existing `gh` auth. Dependencies: git + gh (python3 only for opt-in telemetry).
 #
 #   khub init [dir]   clone the hub as a sibling under dir (default: cwd)
 #   khub update       fast-forward the hub clone (--dry-run previews; --reset)
 #   khub upgrade      update the khub CLI itself (--check only reports)
 #   khub doctor       diagnose the setup (--report emits a redacted diagnostic)
 #   khub version      print the CLI version + the clone's latest snapshot
+#   khub track        opt-in LOCAL-ONLY session telemetry (enable|disable|status|
+#                     repair|task|debug|doctor|purge) — OFF by default
+#   khub metrics      latest session's local report (--by-task: tokens per ticket)
+#   khub export       redacted, review-before-send bundle of the metrics
 #
 # The hub clone is PULL-ONLY: your work lives in your own code repos, which point
 # back at ../knowledge-hub for context. Never commit into the clone.
@@ -543,7 +547,6 @@ cmd_upgrade() {
 # All JSON work is delegated to lib/telemetry/settings_merge.py — this bash never
 # parses JSON. Every command-substitution below is guarded so `set -e` cannot abort
 # mid-mutation and leave a half-applied state.
-TELEMETRY_SCHEMA_VERSION=1
 _KHUB_EMBED_DIR=""
 
 # khub's own helper files. A full checkout keeps them under lib/ beside the script;
@@ -581,19 +584,21 @@ tel_helper() {  # <basename, e.g. settings_merge.py>
   local libf; libf="$(khub_lib_dir)/telemetry/$1"
   if [ -f "$libf" ]; then printf '%s' "$libf"; else printf '%s/%s' "$_KHUB_EMBED_DIR" "$1"; fi
 }
-tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-tel_task_file()   { printf '%s/khub/telemetry-task' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-tel_salt_file()   { printf '%s/khub/telemetry-salt' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-tel_cohort_file() { printf '%s/khub/telemetry-cohort' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-tel_debug_file()  { printf '%s/khub/telemetry-debug' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
-tel_dpa_token_file() { printf '%s/khub/telemetry-dpa-token' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+# One resolver for every telemetry config path: the conf plus its one-value-per-file
+# sidecars (task, salt, cohort, debug marker, DPA token). The layout lives HERE and in
+# the python hook's load_config() — nowhere else.
+tel_cfg_path() {  # <conf|task|salt|cohort|debug|dpa>
+  local n="$1"
+  case "$n" in conf) n='telemetry.conf' ;; dpa) n='telemetry-dpa-token' ;; *) n="telemetry-$n" ;; esac
+  printf '%s/khub/%s' "${XDG_CONFIG_HOME:-$HOME/.config}" "$n"
+}
 # count directory entries without `ls | wc` (SC2012-clean, glob-safe)
 tel_count() { local n=0 f; for f in "$1"/*; do [ -e "$f" ] && n=$((n+1)); done; printf '%d' "$n"; }
 # A per-install random salt, generated ONCE and kept stable, so the fingerprint's
 # identity fields (repo id, skill names) are HMAC'd — an aggregator can't reverse a
 # guessable input. Never leaves the machine.
 tel_ensure_salt() {
-  local sf py; sf="$(tel_salt_file)"
+  local sf py; sf="$(tel_cfg_path salt)"
   [ -s "$sf" ] && return 0
   mkdir -p "$(dirname "$sf")" 2>/dev/null || return 0
   py="$(tel_python3)"
@@ -625,7 +630,7 @@ tel_managed_present() {
 # Read one key=value from the config; prints the value (possibly empty), returns 1 if
 # the key/file is absent so callers can `|| true` and default.
 tel_config_get() {  # <key>
-  local cfg line; cfg="$(tel_config_file)"
+  local cfg line; cfg="$(tel_cfg_path conf)"
   [ -f "$cfg" ] || return 1
   line="$(grep -m1 "^$1=" "$cfg" 2>/dev/null)" || return 1
   printf '%s' "${line#*=}"
@@ -658,13 +663,13 @@ tel_install_hook() {
 # Write the config atomically (temp+rename, 0600). Values are paths/enums/hex — no
 # newlines — so printf is safe and no JSON is constructed in bash.
 tel_write_config() {  # <enabled> <sha> <python3> <scope> <settings_path>
-  local cfg dir tmp; cfg="$(tel_config_file)"; dir="$(dirname "$cfg")"
+  local cfg dir tmp; cfg="$(tel_cfg_path conf)"; dir="$(dirname "$cfg")"
   mkdir -p "$dir" 2>/dev/null || die "cannot create config dir: $(tilde "$dir")"
   tmp="$(mktemp "$dir/.telemetry.XXXXXX")" || die "cannot write telemetry config"
+  # The conf holds ONLY fields that are read back (status/doctor/disable/the hook).
+  # Cohort lives in its own sidecar; metrics records carry their own schema tag.
   {
     printf 'enabled=%s\n' "$1"
-    printf 'schema_version=%s\n' "$TELEMETRY_SCHEMA_VERSION"
-    printf 'cohort=\n'
     printf 'hook_sha256=%s\n' "$2"
     printf 'python3=%s\n' "$3"
     printf 'scope=%s\n' "$4"
@@ -734,7 +739,7 @@ track_enable() {
   tel_write_config 1 "$sha" "$py" "$scope" "$settings"
   tel_ensure_salt   # stable per-install salt for fingerprint identity hashing
   if [ -n "$cohort" ]; then
-    if printf '%s\n' "$cohort" > "$(tel_cohort_file)" 2>/dev/null; then chmod 600 "$(tel_cohort_file)" 2>/dev/null || true; fi
+    if printf '%s\n' "$cohort" > "$(tel_cfg_path cohort)" 2>/dev/null; then chmod 600 "$(tel_cfg_path cohort)" 2>/dev/null || true; fi
   fi
 
   ok "telemetry enabled (${scope} scope${cohort:+, cohort: $cohort})"
@@ -753,15 +758,15 @@ track_disable() {
     warn "could not cleanly unregister from $(tilde "$settings") (code $rc) — remove khub's entries by hand if needed"
   fi
   rm -f "$(tel_hook_file)" 2>/dev/null || true
-  rm -f "$(tel_config_file)" 2>/dev/null || true
-  rm -f "$(tel_task_file)" "$(tel_salt_file)" "$(tel_cohort_file)" "$(tel_debug_file)" 2>/dev/null || true
+  rm -f "$(tel_cfg_path conf)" 2>/dev/null || true
+  rm -f "$(tel_cfg_path salt)" "$(tel_cfg_path cohort)" "$(tel_cfg_path debug)" 2>/dev/null || true
   rm -f "${settings}.khub-lock" 2>/dev/null || true   # persistent flock sibling
   ok "telemetry disabled — hook unregistered and removed"
   detail "settings.json backups are kept for safety (a later 'khub track purge' will remove them + the local store)"
 }
 
 track_status() {
-  local cfg; cfg="$(tel_config_file)"
+  local cfg; cfg="$(tel_cfg_path conf)"
   title "khub track — telemetry status"
   if [ ! -f "$cfg" ]; then
     info "telemetry is OFF (not enabled)"
@@ -779,7 +784,7 @@ track_status() {
 
   if [ "$enabled" = "1" ]; then ok "enabled (${scope} scope)"; else warn "config present but disabled"; fi
   detail "settings: $(tilde "$settings")"
-  if [ -s "$(tel_cohort_file)" ]; then detail "cohort:   $(head -1 "$(tel_cohort_file)" 2>/dev/null)"; fi
+  if [ -s "$(tel_cfg_path cohort)" ]; then detail "cohort:   $(head -1 "$(tel_cfg_path cohort)" 2>/dev/null)"; fi
 
   local st start end drift
   st="$(tel_merge status "$settings" --command "$(tel_hook_command "$py" "$hook")" 2>/dev/null || true)"
@@ -792,7 +797,7 @@ track_status() {
     bad "hook registration incomplete (start=${start:-?} end=${end:-?})"; hint "run 'khub track repair'"
   fi
 
-  # hook-file integrity (F6): a tampered hook runs every session and is invisible to
+  # hook-file integrity: a tampered hook runs every session and is invisible to
   # a presence-only check — recompute the digest and compare to the one from enable.
   if [ -f "$hook" ]; then
     local sha_now; sha_now="$(sha256_of "$hook" 2>/dev/null || true)"
@@ -813,7 +818,7 @@ track_status() {
 }
 
 track_repair() {
-  local cfg; cfg="$(tel_config_file)"
+  local cfg; cfg="$(tel_cfg_path conf)"
   [ -f "$cfg" ] || die "telemetry is not enabled — nothing to repair" "run 'khub track enable'"
   local scope settings py
   scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
@@ -834,7 +839,7 @@ track_repair() {
 # Set/clear/show the active ticket that sessions book their tokens to. Stored in
 # its own file so enable/disable/repair (which rewrite telemetry.conf) never touch it.
 track_task() {
-  local tf; tf="$(tel_task_file)"
+  local tf; tf="$(tel_cfg_path task)"
   if [ $# -eq 0 ]; then
     if [ -s "$tf" ]; then info "active task: $(head -1 "$tf" 2>/dev/null)"
     else info "active task: none (tokens attribute by git branch)"; hint "set one:  khub track task <ticket-id>"; fi
@@ -859,7 +864,7 @@ track_task() {
 
 # Toggle the hook's opt-in debug log (the only visibility into a fail-open hook).
 track_debug() {
-  local df; df="$(tel_debug_file)"
+  local df; df="$(tel_cfg_path debug)"
   case "${1:-status}" in
     on)  mkdir -p "$(dirname "$df")" 2>/dev/null || die "cannot enable debug logging"
          : > "$df"; chmod 600 "$df" 2>/dev/null || true
@@ -875,7 +880,7 @@ track_debug() {
 # config state, registration, integrity, store counts, and the debug-log tail (which
 # is redacted by construction: outcomes + counts, never prompts/paths).
 track_doctor() {
-  local cfg sd; cfg="$(tel_config_file)"; sd="$(tel_state_dir)"
+  local cfg sd; cfg="$(tel_cfg_path conf)"; sd="$(tel_state_dir)"
   title "khub telemetry — doctor (redacted; safe to paste)"
   {
     printf '```\n'
@@ -888,10 +893,10 @@ track_doctor() {
       printf 'enabled: NO (not configured — run: khub track enable)\n'
     fi
     printf 'cohort: %s · salt: %s · debug: %s · task: %s\n' \
-      "$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)" \
-      "$([ -s "$(tel_salt_file)" ] && echo present || echo absent)" \
-      "$([ -f "$(tel_debug_file)" ] && echo on || echo off)" \
-      "$([ -s "$(tel_task_file)" ] && head -1 "$(tel_task_file)" || echo none)"
+      "$([ -s "$(tel_cfg_path cohort)" ] && head -1 "$(tel_cfg_path cohort)" || echo unset)" \
+      "$([ -s "$(tel_cfg_path salt)" ] && echo present || echo absent)" \
+      "$([ -f "$(tel_cfg_path debug)" ] && echo on || echo off)" \
+      "$([ -s "$(tel_cfg_path task)" ] && head -1 "$(tel_cfg_path task)" || echo none)"
     local settings py hook st rec now
     settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$(tel_config_get scope 2>/dev/null || echo user)")"
     py="$(tel_config_get python3 || true)"; [ -n "$py" ] || py="$(tel_python3)"
@@ -920,7 +925,8 @@ track_purge() {
   read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
   track_disable >/dev/null 2>&1 || true                 # unregister hook + remove config/salt/cohort
   rm -rf "$(tel_state_dir)" 2>/dev/null || true         # the whole local data store
-  rm -f "$(tel_dpa_token_file)" 2>/dev/null || true     # revoke external-export consent too
+  rm -f "$(tel_cfg_path task)" 2>/dev/null || true      # the active ticket survives disable, not purge
+  rm -f "$(tel_cfg_path dpa)" 2>/dev/null || true       # revoke external-export consent too
   rm -f "${settings}".khub-bak-* 2>/dev/null || true    # backups hold the full tool config
   ok "telemetry purged — hook removed, all local data + settings backups + consent deleted"
 }
@@ -957,8 +963,8 @@ cmd_export() {
   local lib py; lib="$(tel_helper export_redact.py)" || die "could not materialize the telemetry helper" "reinstall khub"
   py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required" "install python3"
   local cohort salt login ts out
-  cohort="$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)"
-  salt="$([ -s "$(tel_salt_file)" ] && head -1 "$(tel_salt_file)" || echo '')"
+  cohort="$([ -s "$(tel_cfg_path cohort)" ] && head -1 "$(tel_cfg_path cohort)" || echo unset)"
+  salt="$([ -s "$(tel_cfg_path salt)" ] && head -1 "$(tel_cfg_path salt)" || echo '')"
   login="$(gh api user -q .login 2>/dev/null || true)"
   ts="$(date +%Y%m%d-%H%M%S)"; out="$sd/export/$ts"
   set -- --state "$sd" --out "$out" --cohort "$cohort" --home "$HOME"
@@ -966,7 +972,7 @@ cmd_export() {
   [ -n "$login" ] && set -- "$@" --login "$login"
   [ "$with_snippets" = "1" ] && set -- "$@" --with-snippets
   if [ "$cohort" = "external" ]; then
-    set -- "$@" --dpa-token "$(tel_dpa_token_file)"
+    set -- "$@" --dpa-token "$(tel_cfg_path dpa)"
     [ "$with_snippets" = "1" ] && set -- "$@" --exclude-tool-bodies   # default ON for external
   fi
   local rc=0; "$py" "$lib" "$@" || rc=$?
@@ -977,7 +983,7 @@ cmd_export() {
        detail "$(tilde "$out")"
        hint "REVIEW it before sharing — nothing was sent anywhere" ;;
     6) die "external-cohort export is BLOCKED — no DPA consent token" \
-         "a named DPA owner must provision $(tilde "$(tel_dpa_token_file)") first" ;;
+         "a named DPA owner must provision $(tilde "$(tel_cfg_path dpa)") first" ;;
     *) die "export failed (code $rc)" "run 'khub track doctor'" ;;
   esac
 }
@@ -1090,10 +1096,10 @@ parses JSON itself. This is the highest-consequence surface in the telemetry
 feature — a bad merge corrupts the engineer's Claude Code config — so every write
 is:
 
-  * NON-DESTRUCTIVE   only khub's own entries (marked ``_khub``) are added/removed;
-                      co-existing hooks from ClaudeKit or anything else are never
-                      touched, and entries are matched by an explicit marker key,
-                      never by list position or a command substring (spoofable).
+  * NON-DESTRUCTIVE   only khub's own entries are added/removed; co-existing hooks
+                      from ClaudeKit or anything else are never touched. khub's
+                      entries are recognised by the stable hook-path token in their
+                      command (see HOOK_TOKEN below), never by list position.
   * IDEMPOTENT        N enables leave exactly one khub block per event.
   * ATOMIC + MODE-SAFE  write to a temp file in the same dir, preserve the
                       original's permission bits (no 0600->0644 widening), fsync,
@@ -1107,7 +1113,7 @@ is:
 
 Subcommands (the khub CLI is the only caller):
 
-  enable  <settings_path> --version N --command CMD
+  enable  <settings_path> --command CMD
   disable <settings_path>
   status  <settings_path> [--command CMD]      # prints start=/end=/drift= lines
 
@@ -1180,7 +1186,7 @@ def is_khub_entry(entry):
 def make_entry(command):
     # Schema-clean: exactly the {matcher?, hooks} the hookMatcher object permits — no
     # extra keys. No matcher => broadest firing intent (whether a matcher-less
-    # SessionStart fires for every source is a live-session question for Phase 2).
+    # SessionStart fires for every source was verified on a live session).
     # Identity is carried by the command path (HOOK_TOKEN), not a marker key.
     return {"hooks": [{"type": "command", "command": command}]}
 
@@ -1501,72 +1507,51 @@ CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits fi
 DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
 
 
-# ---- paths / gating ---------------------------------------------------------
-def _config_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub", "telemetry.conf")
-
-
-def _state_dir():
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-    return os.path.join(base, "khub-telemetry")
-
-
-def _enabled():
+# ---- config -----------------------------------------------------------------
+# Everything the hook knows about its install lives in ONE loader: the XDG
+# resolution, the conf file (only fields that are read back), and the one-value
+# sidecar files (task, salt, cohort, debug marker). Loaded once per run.
+# Fail-open: any unreadable piece degrades to its OFF/None default, and the loader
+# itself never raises — a broken config must never break a session.
+def _read_sidecar(config_dir, name):
     try:
-        with open(_config_path(), encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip() == "enabled=1":
-                    return True
-    except Exception:
-        return False
-    return False
-
-
-def _task_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub", "telemetry-task")
-
-
-def _active_task():
-    """The manually-set ticket id (`khub track task <id>`), or None to fall back to
-    git-branch attribution."""
-    try:
-        with open(_task_path(), encoding="utf-8") as fh:
-            t = fh.readline().strip()
-            return t or None
+        with open(os.path.join(config_dir, name), encoding="utf-8") as fh:
+            return fh.readline().strip() or None
     except Exception:
         return None
 
 
-def _config_dir():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub")
-
-
-def _read_salt():
-    """Per-install random salt (written by `khub track enable`). Identity fields are
-    HMAC'd with it so the aggregator cannot reverse a guessable input (a cwd/remote/
-    skill name) — hashing guessable inputs without a secret salt is NOT anonymisation."""
+def load_config():
     try:
-        with open(os.path.join(_config_dir(), "telemetry-salt"), encoding="utf-8") as fh:
-            s = fh.readline().strip()
-            return s or None
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "khub")
+        state_dir = os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
+            "khub-telemetry")
+        enabled = False
+        try:
+            with open(os.path.join(config_dir, "telemetry.conf"), encoding="utf-8") as fh:
+                enabled = any(line.strip() == "enabled=1" for line in fh)
+        except Exception:
+            enabled = False
+        return {
+            "enabled": enabled,
+            "state_dir": state_dir,
+            # manually-set ticket id (`khub track task <id>`), or None → git-branch
+            "task": _read_sidecar(config_dir, "telemetry-task"),
+            # per-install random salt: identity fields are HMAC'd with it so an
+            # aggregator cannot reverse a guessable input — no salt, no hash.
+            "salt": _read_sidecar(config_dir, "telemetry-salt"),
+            "cohort": _read_sidecar(config_dir, "telemetry-cohort") or "unset",
+            "debug": os.path.exists(os.path.join(config_dir, "telemetry-debug")),
+        }
     except Exception:
-        return None
+        return {"enabled": False, "state_dir": "", "task": None, "salt": None,
+                "cohort": "unset", "debug": False}
 
 
-def _read_cohort():
-    try:
-        with open(os.path.join(_config_dir(), "telemetry-cohort"), encoding="utf-8") as fh:
-            c = fh.readline().strip()
-            return c or "unset"
-    except Exception:
-        return "unset"
-
-
-def _debug_on():
-    return os.path.exists(os.path.join(_config_dir(), "telemetry-debug"))
+CFG = load_config()
 
 
 def _debug(event, sid, outcome, detail=""):
@@ -1574,10 +1559,10 @@ def _debug(event, sid, outcome, detail=""):
     and why — the only visibility into a hook that otherwise swallows every error.
     Redacted BY CONSTRUCTION: event + a short session-id prefix + an outcome label +
     counts/labels only (never a prompt, path, or exception message). Never raises."""
-    if not _debug_on():
+    if not CFG["debug"]:
         return
     try:
-        state = _state_dir()
+        state = CFG["state_dir"]
         os.makedirs(state, mode=0o700, exist_ok=True)
         log = os.path.join(state, "debug.log")
         sid8 = sid[:8] if isinstance(sid, str) and sid else "-"
@@ -1594,8 +1579,14 @@ def _debug(event, sid, outcome, detail=""):
 
 
 def _salted(salt_hex, value):
-    """Keyed HMAC-SHA256 (truncated) of a value, or None if unsalted/absent. Stored
-    instead of the raw value so a skill name / repo path never leaves as plaintext."""
+    """Keyed HMAC-SHA256 of a value, or None if unsalted/absent. Stored instead of
+    the raw value so a skill name / repo path never leaves as plaintext.
+
+    THE salted-hash contract — keep byte-identical with export_redact._hash():
+    HMAC-SHA256, truncated to 16 hex chars, and NO SALT MEANS NO HASH (a constant-key
+    hash of a guessable input would be pseudo-anonymisation, not anonymisation).
+    Kept as two copies on purpose: a shared module would cost a fifth embedded file
+    in the single-file distribution."""
     if not salt_hex or value is None or value == "":
         return None
     try:
@@ -1942,7 +1933,7 @@ def _hub_present(cwd):
 
 
 def build_fingerprint(session_id, cwd, surface):
-    salt = _read_salt()
+    salt = CFG["salt"]
     harness, has_rules, skills = _detect_setup(cwd)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1958,7 +1949,7 @@ def build_fingerprint(session_id, cwd, surface):
         "skills_hash": _salted(salt, ",".join(skills)) if skills else None,
         "hub_present": _hub_present(cwd),
         "repo_id": _salted(salt, _repo_ident(cwd)),
-        "cohort": _read_cohort(),
+        "cohort": CFG["cohort"],
         "has_salt": bool(salt),
     }
 
@@ -1974,14 +1965,14 @@ def write_fingerprint(payload):
         return                       # don't fingerprint automation sessions either
     cwd = payload.get("cwd") or os.getcwd()
     fp = build_fingerprint(sid, cwd, surface)
-    _atomic_write(os.path.join(_state_dir(), "fingerprint", "%s.json" % sid),
+    _atomic_write(os.path.join(CFG["state_dir"], "fingerprint", "%s.json" % sid),
                   json.dumps(fp, sort_keys=True, indent=2) + "\n")
     _debug("SessionStart", sid, "ok", "harness=%s salt=%s" % (fp["harness"], fp["has_salt"]))
 
 
 def _read_fingerprint(session_id):
     try:
-        with open(os.path.join(_state_dir(), "fingerprint", "%s.json" % session_id), encoding="utf-8") as fh:
+        with open(os.path.join(CFG["state_dir"], "fingerprint", "%s.json" % session_id), encoding="utf-8") as fh:
             fp = json.load(fh)
         return fp if isinstance(fp, dict) else None
     except Exception:
@@ -1992,7 +1983,7 @@ def rollup(session_id, transcript_path):
     if not session_id or not transcript_path or not os.path.isfile(transcript_path):
         _debug("SessionEnd", session_id, "no-transcript")
         return
-    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
+    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, CFG["task"])
     if _dropped_surface(entrypoint):
         _debug("SessionEnd", session_id, "dropped-sdk", entrypoint)
         return                       # automation surface — excluded from the population
@@ -2000,7 +1991,7 @@ def rollup(session_id, transcript_path):
         _debug("SessionEnd", session_id, "dropped-synthetic")
         return                       # a synthetic (non-LLM) session — not real work
     metrics["session_id"] = session_id
-    fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
+    fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint, keyed by the hook-stdin session id
     if fp is not None:
         fp = dict(fp)
         if not fp.get("model"):
@@ -2008,7 +1999,7 @@ def rollup(session_id, transcript_path):
         if fp.get("surface") in (None, "", "unknown"):
             fp["surface"] = metrics.get("entrypoint")
         metrics["setup"] = fp
-    state = _state_dir()
+    state = CFG["state_dir"]
     _atomic_write(os.path.join(state, "metrics", "%s.json" % session_id),
                   json.dumps(metrics, sort_keys=True, indent=2) + "\n")
     _atomic_write(os.path.join(state, "report", "%s.txt" % session_id),
@@ -2031,7 +2022,7 @@ def main():
         return
     event = payload.get("hook_event_name")
     sid = payload.get("session_id")
-    if not _enabled():
+    if not CFG["enabled"]:
         _debug(event, sid, "gated-off")   # logged even when off, to reveal that state
         return
     try:
@@ -2109,10 +2100,13 @@ def main():
 
 
 if __name__ == "__main__":
+    # Interactive verb (`khub metrics --by-task`): a real failure must be VISIBLE,
+    # unlike the fail-open hook. Per-file skips stay inside main().
     try:
         main()
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
 KHUB_EMBEDDED_PY_EOF
 }
 _khub_py_export_redact() {
@@ -2179,8 +2173,8 @@ SECRET_PATTERNS = [
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("secret-assign", re.compile(r"\b[A-Z][A-Z0-9_]{2,}=[^\s\"']{8,}")),
 ]
-# Collapse a home-directory path shape even when it is not the runtime $HOME (F8:
-# a client home /Users/alice/… must not leak just because CI's $HOME differs).
+# Collapse a home-directory path shape even when it is not the runtime $HOME —
+# a client home /Users/alice/… must not leak just because CI's $HOME differs.
 _HOME_SHAPE = re.compile(r"/(Users|home)/[^/\s\"']+")
 
 # Standard Claude Code tools are generic (not client identity); anything else — mcp
@@ -2206,11 +2200,21 @@ def scrub_text(s, home, login):
 
 
 def _hash(salt, value):
+    """THE salted-hash contract — keep byte-identical with capture_hook._salted():
+    HMAC-SHA256, truncated to 16 hex chars, and NO SALT MEANS NO HASH (a constant-key
+    hash of a guessable input would be pseudo-anonymisation, not anonymisation).
+    Kept as two copies on purpose: a shared module would cost a fifth embedded file
+    in the single-file distribution. Callers degrade a None to an 'unknown' bucket."""
+    if not salt or value is None or value == "":
+        return None
     try:
-        key = bytes.fromhex(salt) if salt else b"khub"
-    except ValueError:
-        key = (salt or "khub").encode("utf-8")
-    return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+        key = bytes.fromhex(salt)
+    except (ValueError, TypeError):
+        key = salt.encode("utf-8")
+    try:
+        return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    except Exception:
+        return None
 
 
 def _scrub_obj(obj, home, login):
@@ -2227,13 +2231,14 @@ def _scrub_obj(obj, home, login):
 def _mask_tool(name, salt, cohort):
     """Hash mcp/plugin tool names (toolchain identity) for every cohort; hash any
     non-generic tool/subagent name for the external cohort. Generic tools pass through
-    so the tool-usage pattern stays readable."""
+    so the tool-usage pattern stays readable. Saltless degrades to a fixed 'unknown'
+    bucket — identity never leaves un-salted, counts survive."""
     if not isinstance(name, str):
         return name
     if name.startswith("mcp__"):
-        return "mcp:%s" % _hash(salt, name)
+        return "mcp:%s" % (_hash(salt, name) or "unknown")
     if cohort == "external" and name not in GENERIC_TOOLS:
-        return "tool:%s" % _hash(salt, name)
+        return "tool:%s" % (_hash(salt, name) or "unknown")
     return name
 
 
@@ -2248,10 +2253,23 @@ def sanitize_metrics(rec, cohort, salt, home, login):
     # external cohort: task/branch labels + subagent-type names can identify — hash them
     if cohort == "external":
         if isinstance(out.get("task"), str):
-            out["task"] = "task:%s" % _hash(salt, out["task"])
+            out["task"] = "task:%s" % (_hash(salt, out["task"]) or "unknown")
         tbt = out.get("tokens_by_task")
         if isinstance(tbt, dict):
-            out["tokens_by_task"] = {("task:%s" % _hash(salt, k)): v for k, v in tbt.items()}
+            # saltless keys all become task:unknown — MERGE their token counts
+            # instead of letting a dict comprehension keep only the last one.
+            merged = {}
+            for k, v in tbt.items():
+                nk = "task:%s" % (_hash(salt, k) or "unknown")
+                if nk in merged and isinstance(merged[nk], dict) and isinstance(v, dict):
+                    for tk, tv in v.items():
+                        try:
+                            merged[nk][tk] = merged[nk].get(tk, 0) + int(tv)
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    merged[nk] = dict(v) if isinstance(v, dict) else v
+            out["tokens_by_task"] = merged
         sub = out.get("subagents")
         if isinstance(sub, dict) and isinstance(sub.get("types"), dict):
             sub = dict(sub)
@@ -2292,7 +2310,8 @@ def build_bundle(args):
         with open(os.path.join(args.out, "snippets.redacted.ndjson"), "w", encoding="utf-8") as out:
             for path in sorted(glob.glob(os.path.join(args.state, "capture", "*.jsonl"))):
                 try:
-                    lines = open(path, encoding="utf-8").read().splitlines()
+                    with open(path, encoding="utf-8") as fh:
+                        lines = fh.read().splitlines()
                 except Exception:
                     continue
                 for line in lines:   # per-LINE: one bad line never drops the rest

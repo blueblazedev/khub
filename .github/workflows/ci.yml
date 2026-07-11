@@ -23,14 +23,14 @@ jobs:
           # shellcheck is preinstalled on ubuntu runners, NOT macos. Its analysis is
           # OS-independent, so the ubuntu leg provides full static-analysis coverage.
           if command -v shellcheck >/dev/null; then
-            shellcheck khub install.sh tests/telemetry/*.sh
+            shellcheck khub install.sh tests/telemetry/*.sh scripts/check-embedded-telemetry.sh
           else
             echo "shellcheck not preinstalled on ${{ matrix.os }} — ubuntu leg covers static analysis"
           fi
           # macOS /bin/bash is 3.2 (the compatibility floor) — prove everything parses under it.
           /bin/bash -n khub
           /bin/bash -n install.sh
-          for t in tests/telemetry/*.sh; do /bin/bash -n "$t"; done
+          for t in tests/telemetry/*.sh scripts/check-embedded-telemetry.sh; do /bin/bash -n "$t"; done
 
   telemetry:
     strategy:

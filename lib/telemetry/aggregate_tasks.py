@@ -52,7 +52,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # Interactive verb (`khub metrics --by-task`): a real failure must be VISIBLE,
+    # unlike the fail-open hook. Per-file skips stay inside main().
     try:
         main()
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)

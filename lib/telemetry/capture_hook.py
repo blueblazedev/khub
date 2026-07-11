@@ -46,72 +46,51 @@ CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits fi
 DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
 
 
-# ---- paths / gating ---------------------------------------------------------
-def _config_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub", "telemetry.conf")
-
-
-def _state_dir():
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-    return os.path.join(base, "khub-telemetry")
-
-
-def _enabled():
+# ---- config -----------------------------------------------------------------
+# Everything the hook knows about its install lives in ONE loader: the XDG
+# resolution, the conf file (only fields that are read back), and the one-value
+# sidecar files (task, salt, cohort, debug marker). Loaded once per run.
+# Fail-open: any unreadable piece degrades to its OFF/None default, and the loader
+# itself never raises — a broken config must never break a session.
+def _read_sidecar(config_dir, name):
     try:
-        with open(_config_path(), encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip() == "enabled=1":
-                    return True
-    except Exception:
-        return False
-    return False
-
-
-def _task_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub", "telemetry-task")
-
-
-def _active_task():
-    """The manually-set ticket id (`khub track task <id>`), or None to fall back to
-    git-branch attribution."""
-    try:
-        with open(_task_path(), encoding="utf-8") as fh:
-            t = fh.readline().strip()
-            return t or None
+        with open(os.path.join(config_dir, name), encoding="utf-8") as fh:
+            return fh.readline().strip() or None
     except Exception:
         return None
 
 
-def _config_dir():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "khub")
-
-
-def _read_salt():
-    """Per-install random salt (written by `khub track enable`). Identity fields are
-    HMAC'd with it so the aggregator cannot reverse a guessable input (a cwd/remote/
-    skill name) — hashing guessable inputs without a secret salt is NOT anonymisation."""
+def load_config():
     try:
-        with open(os.path.join(_config_dir(), "telemetry-salt"), encoding="utf-8") as fh:
-            s = fh.readline().strip()
-            return s or None
+        home = os.path.expanduser("~")
+        config_dir = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "khub")
+        state_dir = os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
+            "khub-telemetry")
+        enabled = False
+        try:
+            with open(os.path.join(config_dir, "telemetry.conf"), encoding="utf-8") as fh:
+                enabled = any(line.strip() == "enabled=1" for line in fh)
+        except Exception:
+            enabled = False
+        return {
+            "enabled": enabled,
+            "state_dir": state_dir,
+            # manually-set ticket id (`khub track task <id>`), or None → git-branch
+            "task": _read_sidecar(config_dir, "telemetry-task"),
+            # per-install random salt: identity fields are HMAC'd with it so an
+            # aggregator cannot reverse a guessable input — no salt, no hash.
+            "salt": _read_sidecar(config_dir, "telemetry-salt"),
+            "cohort": _read_sidecar(config_dir, "telemetry-cohort") or "unset",
+            "debug": os.path.exists(os.path.join(config_dir, "telemetry-debug")),
+        }
     except Exception:
-        return None
+        return {"enabled": False, "state_dir": "", "task": None, "salt": None,
+                "cohort": "unset", "debug": False}
 
 
-def _read_cohort():
-    try:
-        with open(os.path.join(_config_dir(), "telemetry-cohort"), encoding="utf-8") as fh:
-            c = fh.readline().strip()
-            return c or "unset"
-    except Exception:
-        return "unset"
-
-
-def _debug_on():
-    return os.path.exists(os.path.join(_config_dir(), "telemetry-debug"))
+CFG = load_config()
 
 
 def _debug(event, sid, outcome, detail=""):
@@ -119,10 +98,10 @@ def _debug(event, sid, outcome, detail=""):
     and why — the only visibility into a hook that otherwise swallows every error.
     Redacted BY CONSTRUCTION: event + a short session-id prefix + an outcome label +
     counts/labels only (never a prompt, path, or exception message). Never raises."""
-    if not _debug_on():
+    if not CFG["debug"]:
         return
     try:
-        state = _state_dir()
+        state = CFG["state_dir"]
         os.makedirs(state, mode=0o700, exist_ok=True)
         log = os.path.join(state, "debug.log")
         sid8 = sid[:8] if isinstance(sid, str) and sid else "-"
@@ -139,8 +118,14 @@ def _debug(event, sid, outcome, detail=""):
 
 
 def _salted(salt_hex, value):
-    """Keyed HMAC-SHA256 (truncated) of a value, or None if unsalted/absent. Stored
-    instead of the raw value so a skill name / repo path never leaves as plaintext."""
+    """Keyed HMAC-SHA256 of a value, or None if unsalted/absent. Stored instead of
+    the raw value so a skill name / repo path never leaves as plaintext.
+
+    THE salted-hash contract — keep byte-identical with export_redact._hash():
+    HMAC-SHA256, truncated to 16 hex chars, and NO SALT MEANS NO HASH (a constant-key
+    hash of a guessable input would be pseudo-anonymisation, not anonymisation).
+    Kept as two copies on purpose: a shared module would cost a fifth embedded file
+    in the single-file distribution."""
     if not salt_hex or value is None or value == "":
         return None
     try:
@@ -487,7 +472,7 @@ def _hub_present(cwd):
 
 
 def build_fingerprint(session_id, cwd, surface):
-    salt = _read_salt()
+    salt = CFG["salt"]
     harness, has_rules, skills = _detect_setup(cwd)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -503,7 +488,7 @@ def build_fingerprint(session_id, cwd, surface):
         "skills_hash": _salted(salt, ",".join(skills)) if skills else None,
         "hub_present": _hub_present(cwd),
         "repo_id": _salted(salt, _repo_ident(cwd)),
-        "cohort": _read_cohort(),
+        "cohort": CFG["cohort"],
         "has_salt": bool(salt),
     }
 
@@ -519,14 +504,14 @@ def write_fingerprint(payload):
         return                       # don't fingerprint automation sessions either
     cwd = payload.get("cwd") or os.getcwd()
     fp = build_fingerprint(sid, cwd, surface)
-    _atomic_write(os.path.join(_state_dir(), "fingerprint", "%s.json" % sid),
+    _atomic_write(os.path.join(CFG["state_dir"], "fingerprint", "%s.json" % sid),
                   json.dumps(fp, sort_keys=True, indent=2) + "\n")
     _debug("SessionStart", sid, "ok", "harness=%s salt=%s" % (fp["harness"], fp["has_salt"]))
 
 
 def _read_fingerprint(session_id):
     try:
-        with open(os.path.join(_state_dir(), "fingerprint", "%s.json" % session_id), encoding="utf-8") as fh:
+        with open(os.path.join(CFG["state_dir"], "fingerprint", "%s.json" % session_id), encoding="utf-8") as fh:
             fp = json.load(fh)
         return fp if isinstance(fp, dict) else None
     except Exception:
@@ -537,7 +522,7 @@ def rollup(session_id, transcript_path):
     if not session_id or not transcript_path or not os.path.isfile(transcript_path):
         _debug("SessionEnd", session_id, "no-transcript")
         return
-    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
+    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, CFG["task"])
     if _dropped_surface(entrypoint):
         _debug("SessionEnd", session_id, "dropped-sdk", entrypoint)
         return                       # automation surface — excluded from the population
@@ -545,7 +530,7 @@ def rollup(session_id, transcript_path):
         _debug("SessionEnd", session_id, "dropped-synthetic")
         return                       # a synthetic (non-LLM) session — not real work
     metrics["session_id"] = session_id
-    fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
+    fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint, keyed by the hook-stdin session id
     if fp is not None:
         fp = dict(fp)
         if not fp.get("model"):
@@ -553,7 +538,7 @@ def rollup(session_id, transcript_path):
         if fp.get("surface") in (None, "", "unknown"):
             fp["surface"] = metrics.get("entrypoint")
         metrics["setup"] = fp
-    state = _state_dir()
+    state = CFG["state_dir"]
     _atomic_write(os.path.join(state, "metrics", "%s.json" % session_id),
                   json.dumps(metrics, sort_keys=True, indent=2) + "\n")
     _atomic_write(os.path.join(state, "report", "%s.txt" % session_id),
@@ -576,7 +561,7 @@ def main():
         return
     event = payload.get("hook_event_name")
     sid = payload.get("session_id")
-    if not _enabled():
+    if not CFG["enabled"]:
         _debug(event, sid, "gated-off")   # logged even when off, to reveal that state
         return
     try:

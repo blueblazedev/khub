@@ -2,7 +2,7 @@
 # Tests for lib/telemetry/export_redact.py — the export bundler + redactor. Proves the
 # default bundle is grep-proof (no raw text / $HOME / login / secret / mcp name / raw
 # repo id), that opt-in snippets are scrubbed, and that the EXTERNAL cohort is
-# hard-blocked without a DPA token. Uses the REAL $HOME (F8) so a client-home shape
+# hard-blocked without a DPA token. Uses the REAL $HOME so a client-home shape
 # can't slip through just because CI's $HOME differs.
 #
 # NOTE: -e intentionally OFF.

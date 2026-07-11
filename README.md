@@ -101,11 +101,12 @@ nothing ever leaves your machine.
 - `khub track enable` — after printing exactly what it does, it backs up your
   `~/.claude/settings.json`, then **non-destructively** registers a small python3
   hook under `SessionStart` + `SessionEnd`. Only khub's own entries are added
-  (identified by a marker, never by position), so any existing hooks are left
+  (identified by their hook path, never by position), so any existing hooks are left
   byte-for-byte intact. Requires `python3`; if it is missing, enable changes
   nothing and tells you. Use `--project` to install into the current repo's
   `.claude/settings.json` instead of user scope.
 - `khub track disable` — removes **only** khub's entries and the hook file; your
+  active task label survives a disable/enable cycle (only `purge` clears it); your
   settings backups are kept.
 - `khub track status` — shows whether telemetry is enabled, whether the hook is
   registered, and whether the hook file still matches what was installed.
@@ -116,8 +117,8 @@ When a session ends, the hook reads that session's transcript and writes **proce
 metrics** — prompt/turn counts, tool usage, token totals, edits, error→retry loops,
 subagents, session duration — to your local state dir. Run **`khub metrics`** to see
 the latest session's report. The metrics file holds **counts only, no raw prompt or
-response text**; a separate raw capture (also local) is kept briefly for a future
-opt-in, redacted export. Automation sessions (any `sdk-*` surface) and synthetic
+response text**; a separate raw capture (also local) is kept briefly for the
+opt-in, redacted `khub export --with-snippets`. Automation sessions (any `sdk-*` surface) and synthetic
 (non-LLM) turns are ignored — only interactive work is measured.
 
 **Tokens per ticket.** To measure how many tokens a task/ticket cost, tag your work:
@@ -145,9 +146,6 @@ prompt/response text. External-cohort export is **hard-blocked in code** without
 data-owner DPA token. `khub track purge` deletes all local data + config + settings
 backups. Full details — exactly what's collected, what can leave, how to disable and
 purge — are in **[docs/telemetry-privacy.md](docs/telemetry-privacy.md)**.
-
-A later release adds `khub export` (metrics-only by default) and `khub track purge`,
-plus a full privacy doc.
 
 ## Pull-only policy
 
