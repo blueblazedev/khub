@@ -49,16 +49,20 @@ RESERVED = ("khub", "blueblazedev", "knowledge-hub")
 # conf schema: field -> validating regex (full-match). ghec/default_branch are
 # consumed by the release-channel rework (release.yml GHEC-gated attestation,
 # client default branch); the compiler validates the full locked schema.
+# Fields whose values land inside double-quoted bash strings in the generated
+# CLI (display_name, bot_author, bot_subject_prefix) exclude every shell-active
+# character ($ ` " \) — a conf value must never expand or execute at runtime.
+# license_text is exempt: it lands only in the LICENSE file, never in code.
 SCHEMA = {
     "slug": r"[a-z][a-z0-9-]*",
-    "display_name": r"[^\n]+",
+    "display_name": r"[A-Za-z0-9][A-Za-z0-9 ._-]*",
     "env_prefix": r"[A-Z][A-Z0-9_]*",
     "org": r"[A-Za-z0-9][A-Za-z0-9-]*",
     "cli_repo": r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+",
     "content_repo": r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+",
     "hub_dirname": r"[A-Za-z0-9._-]+",
-    "bot_author": r"[^\n]+",
-    "bot_subject_prefix": r"[^\n]+",
+    "bot_author": r"[A-Za-z0-9][A-Za-z0-9 ._-]*",
+    "bot_subject_prefix": r"[A-Za-z0-9][A-Za-z0-9 ._:-]*",
     "ghec": r"true|false",
     "default_branch": r"[A-Za-z0-9._/-]+",
     "license_text": r".+",
@@ -363,6 +367,9 @@ def main():
             if pat in out_rel:
                 rule_hits[pat] += out_rel.count(pat)
                 out_rel = out_rel.replace(pat, repl)
+        if out_rel in tree:
+            die("branded path collision: %r and another source file both map "
+                "to %r" % (rel, out_rel))
         tree[out_rel] = branded
         modes[out_rel] = os.stat(src_path).st_mode & 0o777
 

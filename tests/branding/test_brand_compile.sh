@@ -77,6 +77,21 @@ else
   fi
 fi
 
+# 1c. a shell-active conf value (would expand or execute inside the generated
+#     CLI's double-quoted strings) -> schema validation refuses
+bad_conf="$work/bad.conf"
+# shellcheck disable=SC2016  # a LITERAL $USER reaching the compiler is the test
+sed 's/^bot_author=.*/bot_author=eps-bot-$USER/' "$CONF" > "$bad_conf"
+if run_compile "$bad_conf" "$work/out-badconf" >"$work/badconf.log" 2>&1; then
+  _no "gate1c conf: shell-active bot_author compiled clean (must be rejected)"
+else
+  if grep -q 'bot_author' "$work/badconf.log"; then
+    _ok "gate1c conf: shell-active bot_author rejected by schema validation"
+  else
+    _no "gate1c conf: rejected but without naming the field" "$(tail -2 "$work/badconf.log")"
+  fi
+fi
+
 # ---- gate 2: identity zero-grep (contents + filenames, case-insensitive) ----
 leaks="$(grep -rniE 'khub|blueblazedev|knowledge-hub' "$out1" 2>/dev/null || true)"
 fleaks="$(find "$out1" 2>/dev/null | grep -iE 'khub|blueblazedev|knowledge-hub' || true)"
@@ -215,8 +230,14 @@ if [ -f "$mf" ]; then
   [ "${#src_rev}" -eq 64 ] || g9=1
   [ -n "$head_sha" ] && [ "$src_rev" = "$head_sha" ] && g9=1
   [ -n "$conf_rev" ] && [ -n "$comp_rev" ] || g9=1
+  # not just HMAC-shaped: recompute HMAC(key, HEAD) and demand an exact match
+  if [ -n "$head_sha" ]; then
+    want_src="$("$PY" -c 'import hmac,hashlib,sys
+print(hmac.new(open(sys.argv[1],"rb").read().strip(), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$KEY" "$head_sha")"
+    [ "$src_rev" = "$want_src" ] || g9=1
+  fi
   if [ "$g9" -eq 0 ]; then
-    _ok "gate9 manifest: source_rev HMAC'd (64-hex, not the raw SHA); conf_rev + compiler_rev present"
+    _ok "gate9 manifest: source_rev == HMAC(key, HEAD) exactly; conf_rev + compiler_rev present"
   else
     _no "gate9 manifest: rev fields wrong" "source_rev=$src_rev"
   fi

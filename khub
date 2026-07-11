@@ -785,7 +785,10 @@ track_enable() {
   tel_write_config 1 "$sha" "$py" "$scope" "$settings"
   tel_ensure_salt   # stable per-install salt for fingerprint identity hashing
   if [ -n "$cohort" ]; then
-    if printf '%s\n' "$cohort" > "$(tel_cfg_path cohort)" 2>/dev/null; then chmod 600 "$(tel_cfg_path cohort)" 2>/dev/null || true; fi
+    # The cohort sidecar arms the export consent gate — a silent write failure
+    # must not leave a build that promises the gate running without it.
+    if printf '%s\n' "$cohort" > "$(tel_cfg_path cohort)" 2>/dev/null; then chmod 600 "$(tel_cfg_path cohort)" 2>/dev/null || true
+    else warn "could not record the cohort ($cohort) — export gating is unarmed; re-run 'khub track enable'"; fi
   fi
 
   ok "telemetry enabled (${scope} scope${cohort:+, cohort: $cohort})"

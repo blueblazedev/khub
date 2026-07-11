@@ -45,7 +45,9 @@ slug="$(basename "$cli")"
 # ---- gate: zerogrep -------------------------------------------------------------
 leaks="$(grep -rniE 'khub|blueblazedev|knowledge-hub' "$tree" 2>/dev/null | head -5 || true)"
 [ -z "$leaks" ] || fail zerogrep "identity residue in contents: $leaks"
-fleaks="$(find "$tree" | grep -iE 'khub|blueblazedev|knowledge-hub' | head -5 || true)"
+# scan RELATIVE names — an identity string in the tree's own parent path (e.g.
+# a checkout under .../khub-brands/) must not false-fail the filename gate
+fleaks="$( (cd "$tree" && find . | grep -iE 'khub|blueblazedev|knowledge-hub') | head -5 || true)"
 [ -z "$fleaks" ] || fail zerogrep "identity residue in filenames: $fleaks"
 ok zerogrep "no khub/blueblazedev/knowledge-hub in contents or filenames"
 

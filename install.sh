@@ -47,11 +47,13 @@ fi
 
 if [ -z "$VERSION" ]; then
   # Resolve the latest RELEASE tag (a release object — not the main branch).
+  # Probes are `|| true`-guarded so a failure reaches the friendly error below
+  # instead of dying silently under set -e + pipefail.
   if [ "$RELEASE_CHANNEL" = "gh" ]; then
-    VERSION="$(gh api "repos/${REPO}/releases/latest" -q .tag_name 2>/dev/null | head -1)"
+    VERSION="$(gh api "repos/${REPO}/releases/latest" -q .tag_name 2>/dev/null | head -1 || true)"
   else
-    VERSION="$(curl -sfL "${API_BASE}/repos/${REPO}/releases/latest" \
-      | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    VERSION="$(curl -sfL "${API_BASE}/repos/${REPO}/releases/latest" 2>/dev/null \
+      | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
   fi
   [ -n "$VERSION" ] || { echo "error: could not resolve the latest release; set KHUB_INSTALL_VERSION=vX.Y.Z" >&2; exit 1; }
 fi
