@@ -108,6 +108,9 @@ while IFS= read -r -d '' sh; do bash -n "$sh" 2>/dev/null || g3=1; done \
   < <(find "$out1" -name '*.sh' -print0)
 while IFS= read -r -d '' pyf; do "$PY" -m py_compile "$pyf" 2>/dev/null || g3=1; done \
   < <(find "$out1" -name '*.py' -print0)
+# py_compile writes __pycache__ INTO out1 (CI pythons do; some local setups
+# don't) — clean it or the gate-4 determinism diff sees phantom dirs
+find "$out1" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
 if [ "$g3" -eq 0 ]; then
   _ok "gate3 parse: bash -n all shell + py_compile all python green"
 else
