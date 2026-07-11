@@ -27,6 +27,10 @@ HUB_DIRNAME="knowledge-hub"
 BOT_SUBJECT_PREFIX="publish: snapshot"
 BOT_AUTHOR="knowledge-hub-bot"
 STALE_DAYS="${KHUB_STALE_DAYS:-30}"
+# Cohort written by 'track enable' when no --cohort is given. Empty = none (the
+# sidecar is simply not provisioned). A build for an external org substitutes a
+# value here so the export consent gate keyed on the cohort holds out of the box.
+TRACK_DEFAULT_COHORT=""
 
 # ---- terminal style ---------------------------------------------------------
 # 16-color + bold/dim only, and ONLY on an interactive TTY with NO_COLOR unset
@@ -699,6 +703,9 @@ track_enable() {
       *) die "unknown option for track enable: $1" "try: khub track enable [--project] [--cohort internal|external]" ;;
     esac
   done
+  # No explicit --cohort: fall back to this build's default (empty in the public
+  # engine, so nothing changes; a substituted default is validated like a flag).
+  [ -n "$cohort" ] || cohort="$TRACK_DEFAULT_COHORT"
   if [ -n "$cohort" ]; then
     case "$cohort" in internal|external) : ;; *) die "invalid cohort: $cohort" "use --cohort internal|external" ;; esac
   fi

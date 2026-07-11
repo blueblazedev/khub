@@ -19,7 +19,7 @@ _no() { printf '  FAIL %s\n' "$1"; [ $# -ge 2 ] && printf '       %s\n' "$2"; fa
 [ -n "$PY" ] || { echo "python3 required"; exit 1; }
 
 SALT="deadbeefdeadbeefdeadbeefdeadbeef"
-LOGIN="khanhtestlogin"
+LOGIN="caseytestlogin"
 
 # build a state dir with one metrics record (mcp tool + branch label + salted setup)
 # and one raw capture turn carrying planted secrets incl. the REAL $HOME.
