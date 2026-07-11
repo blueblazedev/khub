@@ -133,6 +133,7 @@ g5=""
 [ -e "$out1/scripts/brand-compile.py" ] && g5="${g5} brand-compile.py present"
 [ -e "$out1/scripts/brand-verify.sh" ] && g5="${g5} brand-verify.sh present"
 [ -d "$out1/tests/branding" ] && g5="${g5} tests/branding present"
+[ -e "$out1/docs/white-label.md" ] && g5="${g5} white-label.md present"
 grep -q 'BEGIN branding job' "$out1/.github/workflows/ci.yml" 2>/dev/null && g5="${g5} branding CI job present"
 if [ -z "$g5" ]; then
   _ok "gate5 exclusion: no self-rebrand kit in the branded tree"

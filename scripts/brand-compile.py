@@ -68,8 +68,10 @@ SCHEMA = {
     "license_text": r".+",
 }
 
-# paths (relative, exact or prefix/) that never enter a branded tree
-EXCLUDE_EXACT = ("scripts/brand-compile.py", "scripts/brand-verify.sh")
+# paths (relative, exact or prefix/) that never enter a branded tree — the
+# compiler, the verifier, their tests, and the doc describing the mechanism
+EXCLUDE_EXACT = ("scripts/brand-compile.py", "scripts/brand-verify.sh",
+                 "docs/white-label.md")
 EXCLUDE_PREFIX = ("tests/branding/",)
 CI_JOB_BEGIN = "# >>> BEGIN branding job"
 CI_JOB_END = "# <<< END branding job"
