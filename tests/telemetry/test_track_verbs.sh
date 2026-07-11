@@ -173,8 +173,11 @@ if [ "$rc" -eq 0 ] && [ -f "$sb/state/khub-telemetry/metrics/wire.json" ]; then
   _ok "wire: the installed hook turns a transcript into metrics, exit 0"
 else _no "wire: installed hook produced no metrics (rc=$rc)"; fi
 out="$(run_khub "$sb" metrics 2>&1)"
-if printf '%s' "$out" | grep -q 'prompts: 3'; then _ok "khub metrics: shows the latest session report"
-else _no "khub metrics: did not surface the report" "$out"; fi
+if printf '%s' "$out" | grep -q 'prompts: 3' \
+   && printf '%s' "$out" | grep -q 'raw session log' \
+   && printf '%s' "$out" | grep -q 'capture/wire.jsonl'; then
+  _ok "khub metrics: shows the latest report + where the raw/metrics/fingerprint files live"
+else _no "khub metrics: missing report or file-location guide" "$out"; fi
 # gated: enabled flag gone => same hook writes nothing, still exit 0
 rm -f "$(config_of "$sb")"
 printf '{"hook_event_name":"SessionEnd","session_id":"gated","transcript_path":"%s"}' "$fixture" | \

@@ -962,8 +962,19 @@ cmd_metrics() {
   fi
   title "khub metrics — latest session"
   cat "$latest"
-  detail "report:  $(tilde "$latest")"
-  detail "${n} session(s) captured in $(tilde "$rdir")"
+  say ""
+  local sd sid base; sd="$(tel_state_dir)"; sid="$(basename "$latest" .txt)"
+  # Collapse $HOME to ~ WITHOUT truncating (tilde() truncates) so paths stay copy-pastable.
+  base="$sd"; case "$base" in "$HOME"*) base="~${base#"$HOME"}" ;; esac
+  detail "${n} session(s) captured. everything is local, under:  ${base}/"
+  detail "  metrics/${sid}.json      metric report — counts only, export-safe"
+  detail "  report/${sid}.txt        rendered report (the printout above)"
+  detail "  fingerprint/${sid}.json  setup fingerprint (harness/model/cohort)"
+  detail "  capture/${sid}.jsonl     raw session log — full prompt+response text, local-only, auto-purged 14d"
+  [ -f "$sd/debug.log" ] && detail "  debug.log                hook activity log (from 'khub track debug on')"
+  detail "(the paths above are the LATEST session; each session has its own <id> files in the same dirs)"
+  hint "output tokens per ticket:  khub metrics --by-task"
+  hint "redacted status to share:  khub track doctor"
 }
 
 usage() {
