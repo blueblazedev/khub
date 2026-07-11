@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"ok prompt"},"timestamp":"2026-07-10T10:00:00Z","entrypoint":"cli"}
+{ this is not valid json at all 
+{"type":"assistant","timestamp":"2026-07-10T10:00:05Z","entrypoint":"cli","message":{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Bash","input":{}}],"usage":{"input_tokens":5,"output_tokens":5}}}

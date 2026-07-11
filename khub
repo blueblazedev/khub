@@ -6,15 +6,16 @@ set -euo pipefail
 # YOUR existing `gh` auth. Dependencies: git + gh (nothing else).
 #
 #   khub init [dir]   clone the hub as a sibling under dir (default: cwd)
-#   khub update       fast-forward the hub clone to the latest snapshot
-#   khub doctor       diagnose the setup (auth, access, sibling layout, freshness)
+#   khub update       fast-forward the hub clone (--dry-run previews; --reset)
+#   khub upgrade      update the khub CLI itself (--check only reports)
+#   khub doctor       diagnose the setup (--report emits a redacted diagnostic)
 #   khub version      print the CLI version + the clone's latest snapshot
 #
 # The hub clone is PULL-ONLY: your work lives in your own code repos, which point
 # back at ../knowledge-hub for context. Never commit into the clone.
 # =============================================================================
 
-KHUB_VERSION="0.1.2"
+KHUB_VERSION="0.3.0"
 ORG="blueblazedev"
 KHUB_REPO="${ORG}/khub"   # where the CLI itself lives (for self-upgrade)
 CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/knowledge-hub-client}"
@@ -23,15 +24,53 @@ BOT_SUBJECT_PREFIX="publish: snapshot"
 BOT_AUTHOR="knowledge-hub-bot"
 STALE_DAYS="${KHUB_STALE_DAYS:-30}"
 
-# ---- output helpers ---------------------------------------------------------
-c_reset=''; c_red=''; c_grn=''; c_ylw=''
-if [ -t 1 ]; then c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; fi
-say()  { printf '%s\n' "$*"; }
-ok()   { printf '  %sPASS%s  %s\n' "$c_grn" "$c_reset" "$*"; }
-warn() { printf '  %sWARN%s  %s\n' "$c_ylw" "$c_reset" "$*"; }
-bad()  { printf '  %sFAIL%s  %s\n' "$c_red" "$c_reset" "$*"; }
-# die "message" ["one-line fix hint"]
-die()  { printf '%serror:%s %s\n' "$c_red" "$c_reset" "$1" >&2; [ $# -ge 2 ] && printf '  fix: %s\n' "$2" >&2; exit 1; }
+# ---- terminal style ---------------------------------------------------------
+# 16-color + bold/dim only, and ONLY on an interactive TTY with NO_COLOR unset
+# (piped/redirected/NO_COLOR runs therefore emit zero ANSI bytes).
+c_reset=''; c_red=''; c_grn=''; c_ylw=''; c_blu=''; c_cyan=''; c_bold=''; c_dim=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+  c_blu=$'\033[34m'; c_cyan=$'\033[36m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+fi
+# Glyphs: Unicode when the locale is UTF-8, else fixed-width ASCII so columns
+# stay aligned. POSIX precedence: LC_ALL, then LC_CTYPE, then LANG.
+_loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$_loc" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*)
+    g_ok='✓'; g_warn='⚠'; g_bad='✗'; g_info='ℹ'; g_arrow='→'; g_pipe='│' ;;
+  *)
+    g_ok='OK'; g_warn='!!'; g_bad='XX'; g_info='i '; g_arrow='->'; g_pipe='|' ;;
+esac
+
+say()    { printf '%s\n' "$*"; }
+# cyan '>' marker + bold title
+title()  { printf '%s%s>%s %s%s%s\n' "$c_cyan" "$c_bold" "$c_reset" "$c_bold" "$*" "$c_reset"; }
+# check rows: colored glyph carries the status; the message stays plain
+ok()     { printf '  %s%s%s %s\n' "$c_grn" "$g_ok"   "$c_reset" "$*"; }
+warn()   { printf '  %s%s%s %s\n' "$c_ylw" "$g_warn" "$c_reset" "$*"; }
+bad()    { printf '  %s%s%s %s\n' "$c_red" "$g_bad"  "$c_reset" "$*"; }
+info()   { printf '  %s%s%s %s\n' "$c_blu" "$g_info" "$c_reset" "$*"; }
+# dim '→' fix-hint continuation and dim detail line
+hint()   { printf '  %s%s %s%s\n' "$c_dim" "$g_arrow" "$*" "$c_reset"; }
+detail() { printf '  %s%s%s\n' "$c_dim" "$*" "$c_reset"; }
+# doctor-only frame: a dim │ guide down the left, bold-cyan section headers
+frame_section() { printf '%s%s%s %s%s%s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_bold$c_cyan" "$*" "$c_reset"; }
+fok()    { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_grn" "$g_ok"   "$c_reset" "$*"; }
+fwarn()  { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_ylw" "$g_warn" "$c_reset" "$*"; }
+fbad()   { printf '%s%s%s %s%s%s %s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_red" "$g_bad"  "$c_reset" "$*"; }
+fhint()  { printf '%s%s%s   %s%s %s%s\n' "$c_dim" "$g_pipe" "$c_reset" "$c_dim" "$g_arrow" "$*" "$c_reset"; }
+# die keeps a red 'error:'; the fix hint becomes a dim '→'
+die()    {
+  printf '%serror:%s %s\n' "$c_red" "$c_reset" "$1" >&2
+  if [ $# -ge 2 ]; then printf '  %s%s %s%s\n' "$c_dim" "$g_arrow" "$2" "$c_reset" >&2; fi
+  exit 1
+}
+# Display a path with $HOME collapsed to ~ and a long middle elided.
+tilde() {
+  local p="$1"
+  case "$p" in "$HOME"*) p="~${p#"$HOME"}" ;; esac
+  if [ "${#p}" -gt 48 ]; then printf '%s…%s' "${p:0:24}" "${p: -21}"; else printf '%s' "$p"; fi
+}
 
 # ---- individual checks (reused by doctor AND init preflight) -----------------
 have_git()   { command -v git >/dev/null 2>&1; }
@@ -89,21 +128,148 @@ has_local_commits() {  # commits on HEAD not on the upstream = someone wrote to 
   [ -n "$(git -C "$1" rev-list '@{u}..HEAD' 2>/dev/null)" ]
 }
 
+# ---- sha256 (portable) ------------------------------------------------------
+# Compute a file's sha256 with whichever tool exists (both preinstalled on
+# macOS/Linux). String-compared later — avoids `-c` flag divergence.
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else return 1; fi
+}
+
+# ---- upgrade-nudge cache ----------------------------------------------------
+# Cache the latest-release probe so version/doctor can mention a newer CLI
+# without a network round-trip each time. Positive entries live 7d; a failed
+# probe writes a negative stamp that lives 1d, so offline/proxied users retry at
+# most once a day instead of stalling 2s on every command.
+NUDGE_TTL_OK=604800
+NUDGE_TTL_NEG=86400
+cache_dir()  { printf '%s/khub' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+cache_file() { printf '%s/khub/latest-release' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+# A release tag we will trust enough to cache and later print near a terminal.
+# Anchored allowlist (^v[0-9][0-9A-Za-z.+-]*$) kills ANSI/OSC injection via a
+# crafted tag_name (the API field is attacker-influenced if a release is forged).
+valid_tag() {
+  case "$1" in v[0-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9A-Za-z.+-]*) return 1 ;; esac
+  return 0
+}
+# Probe the latest tag. MUST NOT abort under set -e (fully guarded) and MUST be
+# time-boxed (curl -m 2). Writes a positive or negative cache stamp.
+nudge_probe() {
+  local tag
+  mkdir -p "$(cache_dir)" 2>/dev/null || return 0
+  tag="$(curl -m 2 -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+  if [ -n "$tag" ] && valid_tag "$tag"; then
+    printf '%s %s\n' "$tag" "$(date +%s)" > "$(cache_file)" 2>/dev/null || true
+  else
+    printf -- '- %s\n' "$(date +%s)" > "$(cache_file)" 2>/dev/null || true
+  fi
+  return 0
+}
+# Read the cache. Prints "<tag>" (fresh positive), "-" (fresh negative — a probe
+# failed recently, stay quiet), or nothing (stale/missing → caller should probe).
+# Always returns 0 so it is safe on the right of an assignment under set -e.
+nudge_cache_read() {
+  local f line tag stamp now age
+  f="$(cache_file)"
+  if [ ! -f "$f" ]; then return 0; fi
+  line="$(head -1 "$f" 2>/dev/null || true)"
+  if [ -z "$line" ]; then return 0; fi
+  tag="${line%% *}"; stamp="${line##* }"
+  case "$stamp" in ''|*[!0-9]*) return 0 ;; esac
+  # Force base-10: a leading-zero stamp (e.g. 0888) is an invalid OCTAL literal in
+  # $(( )) and would abort under set -e — an all-digits guard alone is not enough.
+  now="$(date +%s)"; age=$(( now - 10#${stamp} ))
+  if [ "$tag" = "-" ]; then
+    if [ "$age" -lt "$NUDGE_TTL_NEG" ]; then printf -- '-'; fi
+    return 0
+  fi
+  if [ "$age" -ge "$NUDGE_TTL_OK" ]; then return 0; fi
+  if ! valid_tag "$tag"; then return 0; fi
+  printf '%s' "$tag"
+  return 0
+}
+# Emit the upgrade nudge (one ℹ line) when a newer release is known. Uses a fresh
+# cache as-is; probes once when stale/missing. `update` never calls this.
+nudge_line() {
+  local tag
+  tag="$(nudge_cache_read)"
+  if [ -z "$tag" ]; then nudge_probe; tag="$(nudge_cache_read)"; fi
+  if [ -z "$tag" ] || [ "$tag" = "-" ]; then return 0; fi
+  if [ "$tag" = "v${KHUB_VERSION}" ]; then return 0; fi
+  info "khub ${tag} is available — run 'khub upgrade'"
+}
+
+# ---- doctor --report --------------------------------------------------------
+# Redact a block for safe pasting: $HOME → ~ and the gh login (if resolvable) →
+# <user> everywhere (catches a username embedded in a non-HOME path). stdin→stdout.
+redact() {
+  local login
+  login="$(gh api user -q .login 2>/dev/null || true)"
+  if [ -n "$login" ]; then
+    sed -e "s#${HOME}#~#g" -e "s#${login}#<user>#g"
+  else
+    sed -e "s#${HOME}#~#g"
+  fi
+}
+# Emit a fenced, redacted diagnostic block. Printed even when checks FAIL (that
+# is its use case). Args: <hub_path_or_empty> <fail_count>.
+doctor_report() {
+  local hub="$1" fails="$2"
+  local os git_v gh_v auth repo_disp snap botauth ffclean age
+  os="$(uname -sm 2>/dev/null || echo unknown)"
+  git_v="$(git --version 2>/dev/null || echo 'not installed')"
+  gh_v="$(gh --version 2>/dev/null | head -1 || echo 'not installed')"
+  if have_gh && gh_authed; then
+    auth="authenticated (host: $(gh auth status 2>&1 | sed -n 's/.*Logged in to \([^ ]*\).*/\1/p' | head -1 || echo github.com))"
+  else
+    auth="not authenticated"
+  fi
+  if [ -n "${KHUB_CLIENT_REPO:-}" ]; then repo_disp="custom (env-set)"; else repo_disp="default"; fi
+  snap="none"; botauth="n/a"; ffclean="n/a"; age=""
+  if [ -n "$hub" ] && has_commits "$hub"; then
+    snap="$(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
+    if age="$(snapshot_age_days "$hub")"; then :; else age=""; fi
+    if is_bot_snapshot "$hub"; then botauth="yes"; else botauth="no"; fi
+    if has_local_commits "$hub"; then ffclean="no"; else ffclean="yes"; fi
+  fi
+  {
+    printf '```\n'
+    printf 'khub %s\n' "$KHUB_VERSION"
+    printf 'os: %s\n' "$os"
+    printf 'bash: %s\n' "${BASH_VERSION:-unknown}"
+    printf 'git: %s\n' "$git_v"
+    printf 'gh: %s\n' "$gh_v"
+    printf 'gh auth: %s\n' "$auth"
+    printf 'client repo: %s\n' "$repo_disp"
+    if [ -n "$hub" ]; then printf 'hub path: %s\n' "$hub"; else printf 'hub path: not found\n'; fi
+    printf 'snapshot: %s\n' "$snap"
+    if [ -n "$age" ]; then printf 'snapshot age: %sd\n' "$age"; fi
+    printf 'bot-authored: %s\n' "$botauth"
+    printf 'ff-clean: %s\n' "$ffclean"
+    printf 'checks failed: %s\n' "$fails"
+    printf '```\n'
+  } | redact
+}
+
 # ---- verbs ------------------------------------------------------------------
 cmd_version() {
-  say "khub ${KHUB_VERSION}"
+  printf '%skhub %s%s\n' "$c_bold" "$KHUB_VERSION" "$c_reset"
   local hub; if hub="$(find_hub_dir "${1:-}")" && is_git_repo "$hub"; then
-    say "hub clone: $hub"
+    detail "hub clone: $(tilde "$hub")"
     if ! has_commits "$hub"; then
-      say "latest snapshot: none yet (empty clone — no snapshot published)"
+      detail "latest snapshot: none yet (empty clone — no snapshot published)"
     elif is_bot_snapshot "$hub"; then
-      say "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
+      detail "latest snapshot: $(latest_short_sha "$hub")  $(latest_iso_date "$hub")"
     else
-      say "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
+      detail "latest commit: $(latest_short_sha "$hub") (not a published snapshot)"
     fi
   else
-    say "hub clone: not found (run 'khub init')"
+    detail "hub clone: not found (run 'khub init')"
   fi
+  nudge_line
 }
 
 preflight() {
@@ -125,34 +291,65 @@ cmd_init() {
       die "path already exists and is not a hub clone: $target"
     fi
   fi
-  say "Preflight…"; preflight; say "  ok — git, gh auth, API + clone access all good"
-  say "Cloning ${CLIENT_REPO} -> ${target}"
+  title "khub init"
+  say "Preflight…"; preflight; ok "git, gh auth, API + clone access all good"
+  say "Cloning ${CLIENT_REPO} → $(tilde "$target")"
   gh repo clone "$CLIENT_REPO" "$target" >/dev/null 2>&1 || die "clone failed" "re-run 'khub doctor' to diagnose"
   say ""
   if ! has_commits "$target"; then
     warn "the client repo has no published snapshot yet — the clone is empty for now."
-    say  "  Run 'khub update' once the first snapshot is published; nothing else to do."
+    hint "run 'khub update' once the first snapshot is published; nothing else to do."
     return 0
   fi
-  say "Done. The hub is at ${target} (pull-only — keep it current with 'khub update')."
+  ok "the hub is at $(tilde "$target") (pull-only — keep it current with 'khub update')."
   say "Next steps:"
-  say "  • Point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
-  say "  • Read the entry point:          ${target}/AGENTS.md"
-  say "  • Health check any time:         khub doctor"
+  hint "point a code repo at the hub:  (cd \"$target\" && scripts/bootstrap-sibling.sh <your-code-repo-git-url>)"
+  hint "read the entry point:          ${target}/AGENTS.md"
+  hint "health check any time:         khub doctor"
 }
 
 cmd_update() {
-  local path="" reset=0
+  local path="" reset=0 dryrun=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --path) path="${2:-}"; shift 2 ;;
       --reset) reset=1; shift ;;
+      --dry-run) dryrun=1; shift ;;
       *) die "unknown option for update: $1" "see 'khub help'";;
     esac
   done
+  if [ "$dryrun" = "1" ] && [ "$reset" = "1" ]; then die "--dry-run and --reset are mutually exclusive" "pick one"; fi
   local hub; hub="$(find_hub_dir "$path")" || die "no ${HUB_DIRNAME}/ clone found" "run 'khub init' first, or pass --path DIR"
   is_git_repo "$hub" || die "$hub is not a git clone" "re-clone with 'khub init'"
-  say "Updating hub at ${hub}…"
+
+  # --- dry-run: fetch, report what WOULD change, never move HEAD ---
+  if [ "$dryrun" = "1" ]; then
+    title "khub update --dry-run — $(tilde "$hub")"
+    git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
+    if ! has_commits "$hub"; then
+      if git -C "$hub" rev-parse '@{u}' >/dev/null 2>&1; then
+        say "a first snapshot is available — run 'khub update' to pull it."
+      else
+        say "no snapshot published yet — nothing to preview."
+      fi
+      return 0
+    fi
+    if git -C "$hub" merge-base --is-ancestor HEAD '@{u}' 2>/dev/null; then
+      if [ -n "$(git -C "$hub" rev-list 'HEAD..@{u}' 2>/dev/null)" ]; then
+        say "incoming snapshots (not yet applied):"
+        git -C "$hub" log --oneline --no-decorate 'HEAD..@{u}' | while IFS= read -r l; do detail "$l"; done
+        detail "$(git -C "$hub" diff --stat 'HEAD..@{u}' | tail -1)"
+        hint "run 'khub update' to apply"
+      else
+        ok "up to date — nothing to apply."
+      fi
+    else
+      warn "local history has diverged — cannot fast-forward; run 'khub doctor'."
+    fi
+    return 0
+  fi
+
+  title "khub update — $(tilde "$hub")"
   git -C "$hub" fetch --quiet origin || die "fetch failed" "check network + 'khub doctor'"
 
   # Empty clone (client repo had no snapshot when it was cloned): pull the first
@@ -160,18 +357,21 @@ cmd_update() {
   if ! has_commits "$hub"; then
     if git -C "$hub" rev-parse '@{u}' >/dev/null 2>&1; then
       git -C "$hub" merge --ff-only --quiet '@{u}' || die "could not pull the first snapshot" "run 'khub doctor'"
-      say "pulled the first snapshot: $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+      ok "pulled the first snapshot: $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
     else
       say "no snapshot published yet — nothing to update (try again after the first publish)."
     fi
     return 0
   fi
 
+  # Capture HEAD before the merge so we can show exactly what came in.
+  local old; old="$(git -C "$hub" rev-parse HEAD)"
+
   if [ "$reset" = "1" ]; then
-    printf 'This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$hub"
+    printf '%s%s%s This DISCARDS all local changes in %s and matches the published snapshot. Continue? [y/N] ' "$c_ylw" "$g_warn" "$c_reset" "$hub"
     read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
     git -C "$hub" reset --hard '@{u}' --quiet && git -C "$hub" clean -fd >/dev/null 2>&1
-    say "reset to the latest snapshot."
+    ok "reset to the latest snapshot."
   elif git -C "$hub" merge-base --is-ancestor HEAD '@{u}' 2>/dev/null; then
     git -C "$hub" merge --ff-only --quiet '@{u}' || die "fast-forward failed unexpectedly" "run 'khub doctor'"
   else
@@ -190,12 +390,26 @@ cmd_update() {
     fi
   fi
 
+  # What's-new: if HEAD moved (fast-forward only), show the incoming snapshot
+  # subjects (capped) + the diffstat summary line.
+  local new; new="$(git -C "$hub" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$reset" != "1" ] && [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+    local n; n="$(git -C "$hub" rev-list --count "${old}..${new}" 2>/dev/null || echo 0)"
+    say "what's new (${n} snapshot(s)):"
+    # Cap with git itself (-n 20), NOT `| head`: piping to head SIGPIPEs git on a
+    # large catch-up, and under pipefail+set -e that would abort update AFTER the
+    # merge already landed, skipping the tamper/staleness checks below.
+    git -C "$hub" log -n 20 --oneline --no-decorate "${old}..${new}" 2>/dev/null | while IFS= read -r l; do detail "$l"; done
+    if [ "$n" -gt 20 ]; then detail "… and $((n - 20)) more"; fi
+    detail "$(git -C "$hub" diff --stat "${old}..${new}" 2>/dev/null | tail -1)"
+  fi
+
   # post-update sanity: is this a genuine, fresh, untampered snapshot?
   if [ ! -f "$hub/AGENTS.md" ] || [ ! -f "$hub/.knowledge/README.md" ]; then
     warn "expected hub files missing — the clone may be corrupt (re-init)"
   fi
   if is_bot_snapshot "$hub"; then
-    say "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
+    ok "at snapshot $(latest_short_sha "$hub")  ($(latest_iso_date "$hub"))"
   else
     warn "latest commit is not a published snapshot (subject: '$(latest_subject "$hub")') — possible tampering"
   fi
@@ -205,67 +419,622 @@ cmd_update() {
 }
 
 cmd_doctor() {
-  local path=""
-  case "${1:-}" in --path) path="${2:-}";; esac
-  say "khub doctor — ${CLIENT_REPO}"
-  local fails=0
-  if have_git; then ok "git installed"; else bad "git not installed — install git"; fails=$((fails+1)); fi
-  if have_gh; then ok "gh installed"; else bad "gh not installed — https://cli.github.com"; fails=$((fails+1)); fi
-  if have_gh && gh_authed; then ok "gh authenticated"; else bad "gh not authenticated — run 'gh auth login'"; fails=$((fails+1)); fi
-  if have_gh && gh_authed && api_access; then ok "API access to ${CLIENT_REPO}"; else bad "no access to ${CLIENT_REPO} — ask the owner to add you as a collaborator"; fails=$((fails+1)); fi
-  if have_gh && gh_authed && git_transport_access; then ok "git clone access (transport)"; else bad "git cannot clone — run 'gh auth setup-git'"; fails=$((fails+1)); fi
+  local path="" report=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path) path="${2:-}"; shift 2 ;;
+      --report) report=1; shift ;;
+      *) die "unknown option for doctor: $1" "see 'khub help'";;
+    esac
+  done
+  title "khub doctor — ${CLIENT_REPO}"
+  local fails=0 hub=""
 
-  local hub
+  frame_section "SYSTEM"
+  if have_git; then fok "git installed"; else fbad "git not installed"; fhint "install git"; fails=$((fails+1)); fi
+  if have_gh; then fok "gh installed"; else fbad "gh not installed"; fhint "https://cli.github.com"; fails=$((fails+1)); fi
+
+  frame_section "ACCESS"
+  if have_gh && gh_authed; then fok "gh authenticated"; else fbad "gh not authenticated"; fhint "run 'gh auth login'"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && api_access; then fok "API access to ${CLIENT_REPO}"; else fbad "no access to ${CLIENT_REPO}"; fhint "ask the owner to add you as a collaborator"; fails=$((fails+1)); fi
+  if have_gh && gh_authed && git_transport_access; then fok "git clone access (transport)"; else fbad "git cannot clone"; fhint "run 'gh auth setup-git'"; fails=$((fails+1)); fi
+
+  frame_section "HUB CLONE"
   if hub="$(find_hub_dir "$path")"; then
-    ok "hub clone found at $hub"
+    fok "hub clone found at $(tilde "$hub")"
     if ! is_git_repo "$hub"; then
-      bad "$hub exists but is not a git clone — re-init"; fails=$((fails+1))
+      fbad "$(tilde "$hub") exists but is not a git clone"; fhint "re-init"; fails=$((fails+1)); hub=""
     elif ! has_commits "$hub"; then
-      # Empty clone: the client repo has no published snapshot yet. Normal
-      # pre-launch state, not a failure or tampering.
-      warn "clone is empty — no snapshot published yet (run 'khub update' after the first publish)"
+      fwarn "clone is empty — no snapshot published yet (run 'khub update' after the first publish)"
     else
-      if is_bot_snapshot "$hub"; then ok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else bad "latest commit is NOT a published snapshot — possible tampering (re-init)"; fails=$((fails+1)); fi
-      if has_local_commits "$hub"; then bad "clone has local commits — it is pull-only; move work to your own repos"; fails=$((fails+1)); else ok "clone is fast-forward-clean (no local commits)"; fi
+      if is_bot_snapshot "$hub"; then fok "latest commit is a published snapshot ($(latest_short_sha "$hub"))"; else fbad "latest commit is NOT a published snapshot"; fhint "possible tampering — re-init"; fails=$((fails+1)); fi
+      if has_local_commits "$hub"; then fbad "clone has local commits — it is pull-only"; fhint "move work to your own repos"; fails=$((fails+1)); else fok "clone is fast-forward-clean (no local commits)"; fi
       local age; if age="$(snapshot_age_days "$hub")"; then
-        if [ "$age" -gt "$STALE_DAYS" ]; then warn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else ok "snapshot is fresh (${age}d old)"; fi
+        if [ "$age" -gt "$STALE_DAYS" ]; then fwarn "snapshot is ${age}d old (> ${STALE_DAYS}) — ask the owner if publishing is stuck"; else fok "snapshot is fresh (${age}d old)"; fi
       fi
     fi
   else
     # The BOOTSTRAP #1 footgun: a code repo whose CLAUDE.md points at a hub that
     # is not checked out beside it.
     if [ -f "./CLAUDE.md" ] && grep -q "knowledge-hub" ./CLAUDE.md 2>/dev/null; then
-      bad "this repo points at ../${HUB_DIRNAME} but no hub clone is beside it — run: khub init .."
+      fbad "this repo points at ../${HUB_DIRNAME} but no hub clone is beside it"; fhint "run: khub init .."
     else
-      bad "no ${HUB_DIRNAME}/ clone found — run 'khub init'"
+      fbad "no ${HUB_DIRNAME}/ clone found"; fhint "run 'khub init'"
     fi
-    fails=$((fails+1))
+    fails=$((fails+1)); hub=""
   fi
 
+  # A newer CLI is worth surfacing here, before the verdict.
+  nudge_line
+  # The report prints BEFORE the summary and EVEN WHEN checks failed — that is
+  # exactly when a copy-paste diagnostic is wanted. Exit code below is preserved.
+  if [ "$report" = "1" ]; then say ""; doctor_report "$hub" "$fails"; fi
+
   say ""
-  if [ "$fails" -eq 0 ]; then say "${c_grn}all checks passed${c_reset}"; else say "${c_red}${fails} check(s) failed${c_reset} — see fixes above"; return 1; fi
+  if [ "$fails" -eq 0 ]; then
+    printf '%s%s%s all checks passed\n' "$c_grn" "$g_ok" "$c_reset"
+  else
+    printf '%s%s%s %s check(s) failed — see fixes above\n' "$c_red" "$g_bad" "$c_reset" "$fails"
+    return 1
+  fi
 }
 
 cmd_upgrade() {
-  # Self-update the CLI to the latest published release. SEPARATE from `khub
-  # update` (which refreshes your hub CONTENT clone). Fetches install.sh from the
-  # latest release (a pinned asset, never a mutable branch) and runs it against
-  # the directory the current `khub` lives in.
-  # This build takes no upgrade options. Reject unknown args rather than silently
-  # ignoring them, so running a flag that a NEWER khub documents gives a clear
-  # error instead of an unexpected full reinstall.
-  [ $# -eq 0 ] || die "unknown option for upgrade: $1" "this khub (${KHUB_VERSION}) takes no upgrade options — newer versions add them"
+  local check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; shift ;;
+      *) die "unknown option for upgrade: $1" "see 'khub help'";;
+    esac
+  done
   command -v curl >/dev/null 2>&1 || die "curl is required to upgrade" "install curl, then re-run"
   local self bindir tag
   self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"
   bindir="$(dirname "$self")"
-  tag="$(curl -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  tag="$(curl -m 2 -sfL "https://api.github.com/repos/${KHUB_REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
   [ -n "$tag" ] || die "could not resolve the latest khub release" "check your network"
-  say "Upgrading khub (${KHUB_VERSION} → ${tag}) in ${bindir}…"
-  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/install.sh" \
-    | KHUB_INSTALL_VERSION="$tag" KHUB_BIN_DIR="$bindir" bash \
+  valid_tag "$tag" || die "the latest release tag looks malformed — refusing to act on it" "reinstall via the README one-liner"
+  # Refresh the nudge cache from this live probe: keeps version/doctor honest and
+  # prevents nudging "backward" right after a direct upgrade.
+  if mkdir -p "$(cache_dir)" 2>/dev/null; then printf '%s %s\n' "$tag" "$(date +%s)" > "$(cache_file)" 2>/dev/null || true; fi
+
+  if [ "$check" = "1" ]; then
+    if [ "$tag" = "v${KHUB_VERSION}" ]; then
+      ok "khub is up to date (${tag})."
+    else
+      title "khub upgrade --check"
+      say "current: v${KHUB_VERSION}"
+      say "latest:  ${tag}"
+      hint "run 'khub upgrade' to update"
+    fi
+    return 0
+  fi
+
+  if [ "$tag" = "v${KHUB_VERSION}" ]; then ok "already on the latest khub (${tag})."; return 0; fi
+
+  title "Upgrading khub (v${KHUB_VERSION} → ${tag}) in $(tilde "$bindir")"
+  # Verified upgrade: download install.sh AND SHA256SUMS for this tag, verify the
+  # installer BEFORE executing it (no more blind curl|bash). The installer then
+  # re-verifies the binary itself.
+  local sh_tmp sums_tmp expected actual
+  # tmpd is deliberately NOT `local`: the EXIT trap fires in the global scope
+  # after this function returns, so a local would be out of scope there and
+  # set -u would abort the trap with "tmpd: unbound variable".
+  tmpd="$(mktemp -d)" || die "could not create a temp directory"
+  trap 'rm -rf "$tmpd"' EXIT
+  sh_tmp="$tmpd/install.sh"; sums_tmp="$tmpd/SHA256SUMS"
+  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/install.sh" -o "$sh_tmp" \
+    || die "could not download the installer for ${tag}" "retry, or reinstall via the README one-liner"
+  curl -sfL "https://github.com/${KHUB_REPO}/releases/download/${tag}/SHA256SUMS" -o "$sums_tmp" \
+    || die "no checksums published for ${tag} — refusing to run an unverified installer" "retry later, or reinstall via the README one-liner"
+  expected="$(awk '$2 == "install.sh" { print $1 }' "$sums_tmp")"
+  [ -n "$expected" ] || die "checksums for ${tag} have no install.sh entry" "reinstall via the README one-liner"
+  actual="$(sha256_of "$sh_tmp")" || die "no sha256 tool (shasum/sha256sum) available — cannot verify"
+  [ "$actual" = "$expected" ] || die "installer checksum mismatch for ${tag} — refusing to run it" "retry later, or reinstall via the README one-liner"
+  KHUB_INSTALL_VERSION="$tag" KHUB_BIN_DIR="$bindir" bash "$sh_tmp" \
     || die "upgrade failed" "re-run the install one-liner from the ${KHUB_REPO} README"
+}
+
+# ---- track (opt-in session telemetry) ---------------------------------------
+# khub distils a python3 dual-hook (SessionStart + SessionEnd) and NON-DESTRUCTIVELY
+# registers it in ~/.claude/settings.json at user scope, so it can measure "ways of
+# working" from real Claude Code sessions. LOCAL-FIRST, OFF by default, opt-in only.
+# All JSON work is delegated to lib/telemetry/settings_merge.py — this bash never
+# parses JSON. Every command-substitution below is guarded so `set -e` cannot abort
+# mid-mutation and leave a half-applied state.
+TELEMETRY_SCHEMA_VERSION=1
+_KHUB_EMBED_DIR=""
+
+# khub's own helper files. A full checkout keeps them under lib/ beside the script;
+# the single-file install has no lib/, so the same sources are ALSO embedded in this
+# script (see the generated block near the bottom) and materialised on demand. Order:
+# an on-disk lib/ file (dev/checkout, or KHUB_LIB_DIR) wins so edits take effect live;
+# otherwise the embedded copy is written to a temp file. Either way telemetry is fully
+# self-contained — usable from any folder, from the packaged one-liner install.
+khub_lib_dir() {
+  if [ -n "${KHUB_LIB_DIR:-}" ]; then printf '%s' "$KHUB_LIB_DIR"; return 0; fi
+  local self dir
+  self="$(command -v khub 2>/dev/null || true)"; [ -n "$self" ] || self="$0"
+  if [ -L "$self" ]; then self="$(readlink "$self" 2>/dev/null || printf '%s' "$self")"; fi
+  dir="$(cd "$(dirname "$self")" >/dev/null 2>&1 && pwd)" || dir="."
+  printf '%s/lib' "$dir"
+}
+
+# Materialise the embedded helpers into a temp dir when there is no on-disk lib/.
+# MUST run in the parent shell (not a $() subshell) — otherwise the temp dir and its
+# cleanup trap would live and die inside the subshell, deleting the files immediately.
+tel_prepare() {
+  [ -z "$_KHUB_EMBED_DIR" ] || return 0                              # already prepared
+  [ -f "$(khub_lib_dir)/telemetry/settings_merge.py" ] && return 0   # on-disk lib/ wins
+  _KHUB_EMBED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/khub-embed.XXXXXX")" || die "cannot create a temp dir for telemetry helpers"
+  trap 'rm -rf "$_KHUB_EMBED_DIR"' EXIT
+  _khub_py_settings_merge  > "$_KHUB_EMBED_DIR/settings_merge.py"  || die "cannot write the telemetry helper"
+  _khub_py_capture_hook    > "$_KHUB_EMBED_DIR/capture_hook.py"    || die "cannot write the telemetry helper"
+  _khub_py_aggregate_tasks > "$_KHUB_EMBED_DIR/aggregate_tasks.py" || die "cannot write the telemetry helper"
+  _khub_py_export_redact   > "$_KHUB_EMBED_DIR/export_redact.py"   || die "cannot write the telemetry helper"
+}
+
+# Return a runnable path to a helper: the on-disk lib/ file if present (dev/checkout),
+# otherwise the embedded copy tel_prepare wrote. Pure — safe inside $() subshells.
+tel_helper() {  # <basename, e.g. settings_merge.py>
+  local libf; libf="$(khub_lib_dir)/telemetry/$1"
+  if [ -f "$libf" ]; then printf '%s' "$libf"; else printf '%s/%s' "$_KHUB_EMBED_DIR" "$1"; fi
+}
+tel_config_file() { printf '%s/khub/telemetry.conf' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_task_file()   { printf '%s/khub/telemetry-task' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_salt_file()   { printf '%s/khub/telemetry-salt' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_cohort_file() { printf '%s/khub/telemetry-cohort' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_debug_file()  { printf '%s/khub/telemetry-debug' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tel_dpa_token_file() { printf '%s/khub/telemetry-dpa-token' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+# count directory entries without `ls | wc` (SC2012-clean, glob-safe)
+tel_count() { local n=0 f; for f in "$1"/*; do [ -e "$f" ] && n=$((n+1)); done; printf '%d' "$n"; }
+# A per-install random salt, generated ONCE and kept stable, so the fingerprint's
+# identity fields (repo id, skill names) are HMAC'd — an aggregator can't reverse a
+# guessable input. Never leaves the machine.
+tel_ensure_salt() {
+  local sf py; sf="$(tel_salt_file)"
+  [ -s "$sf" ] && return 0
+  mkdir -p "$(dirname "$sf")" 2>/dev/null || return 0
+  py="$(tel_python3)"
+  if [ -n "$py" ]; then "$py" -c 'import secrets;print(secrets.token_hex(16))' > "$sf" 2>/dev/null || true; fi
+  chmod 600 "$sf" 2>/dev/null || true
+}
+tel_hook_dir()    { printf '%s/khub-telemetry' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
+tel_hook_file()   { printf '%s/capture_hook.py' "$(tel_hook_dir)"; }
+tel_state_dir()   { printf '%s/khub-telemetry' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+# Always exits 0 (prints the path, or nothing) so it is safe on an assignment RHS.
+tel_python3()     { command -v python3 2>/dev/null || true; }
+tel_settings_path() {  # <user|project>
+  if [ "$1" = "project" ]; then printf '%s/.claude/settings.json' "$PWD"
+  else printf '%s/.claude/settings.json' "$HOME"; fi
+}
+# The registered command: ABSOLUTE interpreter + hook path (pinned at enable time so
+# a later PATH/venv change cannot 127 a session), guarded `|| exit 0` (fail-open).
+tel_hook_command() { printf "'%s' '%s' || exit 0" "$1" "$2"; }
+
+# Enterprise-managed settings OVERRIDE user settings, so a user-scope merge would be
+# silently overridden — detect the platform managed path and steer to project scope.
+tel_managed_present() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) [ -f "/Library/Application Support/ClaudeCode/managed-settings.json" ] ;;
+    *)      [ -f "/etc/claude-code/managed-settings.json" ] ;;
+  esac
+}
+
+# Read one key=value from the config; prints the value (possibly empty), returns 1 if
+# the key/file is absent so callers can `|| true` and default.
+tel_config_get() {  # <key>
+  local cfg line; cfg="$(tel_config_file)"
+  [ -f "$cfg" ] || return 1
+  line="$(grep -m1 "^$1=" "$cfg" 2>/dev/null)" || return 1
+  printf '%s' "${line#*=}"
+}
+
+# Run the JSON merge helper. Returns the helper's exit code (0 ok, 3 malformed,
+# 4 not-writable, 5 raced). Dies only if the helper file itself is missing.
+tel_merge() {  # <subcommand> <settings_path> [args...]
+  local lib py
+  lib="$(tel_helper settings_merge.py)" || die "could not materialize the telemetry helper" "reinstall khub"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required for khub telemetry" "install python3, then re-run"
+  "$py" "$lib" "$@"
+}
+
+# Install (or reinstall) the hook file 0500 under a 0700 dir; print its sha256.
+# Returns 1 (message on stderr) on any failure so the caller can roll back.
+tel_install_hook() {
+  local src dir dst sha
+  src="$(tel_helper capture_hook.py)" || { printf 'could not materialize the telemetry hook source\n' >&2; return 1; }
+  dir="$(tel_hook_dir)"; dst="$(tel_hook_file)"
+  mkdir -p "$dir" 2>/dev/null || { printf 'cannot create hook dir: %s\n' "$dir" >&2; return 1; }
+  chmod 700 "$dir" 2>/dev/null || true
+  rm -f "$dst" 2>/dev/null || true          # 0500 dest is unwritable; replace it
+  cp "$src" "$dst" || { printf 'cannot install hook file: %s\n' "$dst" >&2; return 1; }
+  chmod 500 "$dst" 2>/dev/null || true
+  sha="$(sha256_of "$dst")" || { printf 'no sha256 tool (shasum/sha256sum) available\n' >&2; return 1; }
+  printf '%s' "$sha"
+}
+
+# Write the config atomically (temp+rename, 0600). Values are paths/enums/hex — no
+# newlines — so printf is safe and no JSON is constructed in bash.
+tel_write_config() {  # <enabled> <sha> <python3> <scope> <settings_path>
+  local cfg dir tmp; cfg="$(tel_config_file)"; dir="$(dirname "$cfg")"
+  mkdir -p "$dir" 2>/dev/null || die "cannot create config dir: $(tilde "$dir")"
+  tmp="$(mktemp "$dir/.telemetry.XXXXXX")" || die "cannot write telemetry config"
+  {
+    printf 'enabled=%s\n' "$1"
+    printf 'schema_version=%s\n' "$TELEMETRY_SCHEMA_VERSION"
+    printf 'cohort=\n'
+    printf 'hook_sha256=%s\n' "$2"
+    printf 'python3=%s\n' "$3"
+    printf 'scope=%s\n' "$4"
+    printf 'settings_path=%s\n' "$5"
+  } > "$tmp" || { rm -f "$tmp"; die "cannot write telemetry config"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$cfg" || { rm -f "$tmp"; die "cannot finalize telemetry config"; }
+}
+
+track_notice() {
+  title "khub track enable — session telemetry (opt-in)"
+  say "Records LOCAL-ONLY, per-session process metrics from your Claude Code sessions"
+  say "(prompt/turn counts, tool usage, token totals, timings) to compare ways of working."
+  hint "captured to your machine only — nothing is sent anywhere"
+  hint "registers a hook in your Claude Code settings.json (backed up first)"
+  hint "what's collected + how to purge:  docs/telemetry-privacy.md"
+  hint "disable + clean any time:  khub track disable"
+  say ""
+}
+
+track_enable() {
+  local scope="user" cohort=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) scope="project"; shift ;;
+      --cohort)  cohort="${2:-}"; shift 2 ;;
+      *) die "unknown option for track enable: $1" "try: khub track enable [--project] [--cohort internal|external]" ;;
+    esac
+  done
+  if [ -n "$cohort" ]; then
+    case "$cohort" in internal|external) : ;; *) die "invalid cohort: $cohort" "use --cohort internal|external" ;; esac
+  fi
+
+  track_notice
+
+  # 1) python3 is REQUIRED — hard-fail, change nothing (no "enabled but capturing
+  #    nothing" half-state).
+  local py; py="$(tel_python3)"
+  [ -n "$py" ] || die "python3 is required for khub telemetry but was not found" \
+    "install python3, then re-run 'khub track enable' — nothing was changed"
+
+  # 2) managed user settings would silently override the merge — steer to project.
+  if [ "$scope" = "user" ] && tel_managed_present; then
+    die "this machine has enterprise-managed Claude Code settings (user scope would be overridden)" \
+      "run 'khub track enable --project' to install into this repo's .claude/settings.json instead"
+  fi
+
+  local settings; settings="$(tel_settings_path "$scope")"
+
+  # 3) install + fingerprint the hook (fallible work BEFORE any enabled flag).
+  local sha; sha="$(tel_install_hook)" || die "could not install the telemetry hook" "see the message above — nothing was enabled"
+
+  # 4) register in settings.json; roll the hook back on any failure.
+  local cmd rc=0; cmd="$(tel_hook_command "$py" "$(tel_hook_file)")"
+  tel_merge enable "$settings" --command "$cmd" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$(tel_hook_file)" 2>/dev/null || true
+    case "$rc" in
+      4) die "cannot write $(tilde "$settings")" "try 'khub track enable --project', or fix its permissions" ;;
+      3) die "$(tilde "$settings") is not valid JSON — refusing to touch it" "fix or move it, then re-run" ;;
+      5) die "$(tilde "$settings") changed while enabling — retry" "run 'khub track enable' again" ;;
+      *) die "could not register the telemetry hook (code $rc)" "run 'khub track status' to inspect" ;;
+    esac
+  fi
+
+  # 5) only now record the enabled flag — every fallible step above already passed.
+  tel_write_config 1 "$sha" "$py" "$scope" "$settings"
+  tel_ensure_salt   # stable per-install salt for fingerprint identity hashing
+  if [ -n "$cohort" ]; then
+    if printf '%s\n' "$cohort" > "$(tel_cohort_file)" 2>/dev/null; then chmod 600 "$(tel_cohort_file)" 2>/dev/null || true; fi
+  fi
+
+  ok "telemetry enabled (${scope} scope${cohort:+, cohort: $cohort})"
+  detail "settings: $(tilde "$settings")  (a backup was kept alongside)"
+  detail "hook:     $(tilde "$(tel_hook_file)")"
+  hint "check it:  khub track status"
+}
+
+track_disable() {
+  local scope settings rc=0
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+
+  tel_merge disable "$settings" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "could not cleanly unregister from $(tilde "$settings") (code $rc) — remove khub's entries by hand if needed"
+  fi
+  rm -f "$(tel_hook_file)" 2>/dev/null || true
+  rm -f "$(tel_config_file)" 2>/dev/null || true
+  rm -f "$(tel_task_file)" "$(tel_salt_file)" "$(tel_cohort_file)" "$(tel_debug_file)" 2>/dev/null || true
+  rm -f "${settings}.khub-lock" 2>/dev/null || true   # persistent flock sibling
+  ok "telemetry disabled — hook unregistered and removed"
+  detail "settings.json backups are kept for safety (a later 'khub track purge' will remove them + the local store)"
+}
+
+track_status() {
+  local cfg; cfg="$(tel_config_file)"
+  title "khub track — telemetry status"
+  if [ ! -f "$cfg" ]; then
+    info "telemetry is OFF (not enabled)"
+    hint "enable with:  khub track enable"
+    return 0
+  fi
+
+  local enabled scope settings py hook sha_recorded
+  enabled="$(tel_config_get enabled || true)"
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+  py="$(tel_config_get python3 || true)"; [ -n "$py" ] || py="$(tel_python3)"
+  hook="$(tel_hook_file)"
+  sha_recorded="$(tel_config_get hook_sha256 || true)"
+
+  if [ "$enabled" = "1" ]; then ok "enabled (${scope} scope)"; else warn "config present but disabled"; fi
+  detail "settings: $(tilde "$settings")"
+  if [ -s "$(tel_cohort_file)" ]; then detail "cohort:   $(head -1 "$(tel_cohort_file)" 2>/dev/null)"; fi
+
+  local st start end drift
+  st="$(tel_merge status "$settings" --command "$(tel_hook_command "$py" "$hook")" 2>/dev/null || true)"
+  start="$(printf '%s\n' "$st" | sed -n 's/^start=//p')"
+  end="$(printf '%s\n' "$st" | sed -n 's/^end=//p')"
+  drift="$(printf '%s\n' "$st" | sed -n 's/^drift=//p')"
+  if [ "$start" = "present" ] && [ "$end" = "present" ]; then
+    ok "hook registered (SessionStart + SessionEnd)"
+  else
+    bad "hook registration incomplete (start=${start:-?} end=${end:-?})"; hint "run 'khub track repair'"
+  fi
+
+  # hook-file integrity (F6): a tampered hook runs every session and is invisible to
+  # a presence-only check — recompute the digest and compare to the one from enable.
+  if [ -f "$hook" ]; then
+    local sha_now; sha_now="$(sha256_of "$hook" 2>/dev/null || true)"
+    if [ -n "$sha_recorded" ] && [ "$sha_now" = "$sha_recorded" ]; then
+      ok "hook file integrity verified"
+    elif [ -n "$sha_recorded" ]; then
+      bad "hook file digest changed since enable (tampering or drift)"; hint "run 'khub track repair'"
+    fi
+  else
+    bad "hook file missing: $(tilde "$hook")"; hint "run 'khub track repair'"
+  fi
+
+  case "$drift" in
+    none) : ;;
+    yes)  warn "hook command drift detected"; hint "run 'khub track repair'" ;;
+    *)    warn "could not read hook registration state" ;;
+  esac
+}
+
+track_repair() {
+  local cfg; cfg="$(tel_config_file)"
+  [ -f "$cfg" ] || die "telemetry is not enabled — nothing to repair" "run 'khub track enable'"
+  local scope settings py
+  scope="$(tel_config_get scope || true)"; [ -n "$scope" ] || scope="user"
+  settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$scope")"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required but was not found" "install python3, then re-run"
+
+  # Rewrite the hook file (repairs a drifted/tampered/missing one) + refresh its sha,
+  # then re-assert registration. Single-shot — never loops, so a reverting managed
+  # settings.json cannot trigger a repair fight.
+  local sha; sha="$(tel_install_hook)" || die "could not reinstall the telemetry hook"
+  local cmd rc=0; cmd="$(tel_hook_command "$py" "$(tel_hook_file)")"
+  tel_merge enable "$settings" --command "$cmd" || rc=$?
+  [ "$rc" -eq 0 ] || die "could not re-register the telemetry hook (code $rc)" "run 'khub track status'"
+  tel_write_config 1 "$sha" "$py" "$scope" "$settings"
+  ok "telemetry repaired — hook reinstalled and re-registered"
+}
+
+# Set/clear/show the active ticket that sessions book their tokens to. Stored in
+# its own file so enable/disable/repair (which rewrite telemetry.conf) never touch it.
+track_task() {
+  local tf; tf="$(tel_task_file)"
+  if [ $# -eq 0 ]; then
+    if [ -s "$tf" ]; then info "active task: $(head -1 "$tf" 2>/dev/null)"
+    else info "active task: none (tokens attribute by git branch)"; hint "set one:  khub track task <ticket-id>"; fi
+    return 0
+  fi
+  case "$1" in
+    --clear|clear)
+      rm -f "$tf" 2>/dev/null || true
+      ok "active task cleared — tokens now attribute by git branch"
+      return 0 ;;
+  esac
+  local id="$1"
+  case "$id" in *[!A-Za-z0-9._/#-]*) die "invalid task id: $id" "allowed: letters, digits, and . _ / # -" ;; esac
+  [ "${#id}" -le 64 ] || die "task id too long (max 64 chars)"
+  mkdir -p "$(dirname "$tf")" 2>/dev/null || die "cannot create config dir"
+  printf '%s\n' "$id" > "$tf" || die "cannot write the task file"
+  chmod 600 "$tf" 2>/dev/null || true
+  ok "active task set: $id"
+  detail "sessions will book their tokens to '$id' until you change or clear it"
+  hint "totals so far:  khub metrics --by-task"
+}
+
+# Toggle the hook's opt-in debug log (the only visibility into a fail-open hook).
+track_debug() {
+  local df; df="$(tel_debug_file)"
+  case "${1:-status}" in
+    on)  mkdir -p "$(dirname "$df")" 2>/dev/null || die "cannot enable debug logging"
+         : > "$df"; chmod 600 "$df" 2>/dev/null || true
+         ok "telemetry debug logging ON"; hint "reproduce a session, then paste:  khub track doctor" ;;
+    off) rm -f "$df" 2>/dev/null || true; ok "telemetry debug logging OFF" ;;
+    status) if [ -f "$df" ]; then info "debug logging: ON"; else info "debug logging: OFF"; hint "enable: khub track debug on"; fi ;;
+    *) die "usage: khub track debug <on|off>" ;;
+  esac
+}
+
+# A redacted, paste-ready diagnostic ($HOME->~, gh login-><user>) — for sharing with
+# support or for an agent to self-detect why capture isn't happening. Carries only
+# config state, registration, integrity, store counts, and the debug-log tail (which
+# is redacted by construction: outcomes + counts, never prompts/paths).
+track_doctor() {
+  local cfg sd; cfg="$(tel_config_file)"; sd="$(tel_state_dir)"
+  title "khub telemetry — doctor (redacted; safe to paste)"
+  {
+    printf '```\n'
+    printf 'khub %s telemetry doctor\n' "$KHUB_VERSION"
+    printf 'os: %s · python3: %s\n' "$(uname -sm 2>/dev/null || echo unknown)" "$(tel_python3 || echo 'NOT FOUND')"
+    if [ -f "$cfg" ]; then
+      printf 'enabled: %s (scope: %s)\n' "$(tel_config_get enabled || echo '?')" "$(tel_config_get scope || echo user)"
+      printf 'settings: %s\n' "$(tel_config_get settings_path || echo '?')"
+    else
+      printf 'enabled: NO (not configured — run: khub track enable)\n'
+    fi
+    printf 'cohort: %s · salt: %s · debug: %s · task: %s\n' \
+      "$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)" \
+      "$([ -s "$(tel_salt_file)" ] && echo present || echo absent)" \
+      "$([ -f "$(tel_debug_file)" ] && echo on || echo off)" \
+      "$([ -s "$(tel_task_file)" ] && head -1 "$(tel_task_file)" || echo none)"
+    local settings py hook st rec now
+    settings="$(tel_config_get settings_path || true)"; [ -n "$settings" ] || settings="$(tel_settings_path "$(tel_config_get scope 2>/dev/null || echo user)")"
+    py="$(tel_config_get python3 || true)"; [ -n "$py" ] || py="$(tel_python3)"
+    hook="$(tel_hook_file)"
+    st="$(tel_merge status "$settings" --command "$(tel_hook_command "$py" "$hook")" 2>/dev/null | tr '\n' ' ' || true)"
+    printf 'registration: %s\n' "${st:-unreadable}"
+    if [ -f "$hook" ]; then
+      rec="$(tel_config_get hook_sha256 || true)"; now="$(sha256_of "$hook" 2>/dev/null || true)"
+      if [ -n "$rec" ] && [ "$rec" = "$now" ]; then printf 'hook integrity: ok\n'; else printf 'hook integrity: MISMATCH (drift/tamper) — run khub track repair\n'; fi
+    else printf 'hook file: MISSING — run khub track repair\n'; fi
+    printf 'store: fingerprints=%s metrics=%s reports=%s captures=%s\n' \
+      "$(tel_count "$sd/fingerprint")" "$(tel_count "$sd/metrics")" "$(tel_count "$sd/report")" "$(tel_count "$sd/capture")"
+    printf -- '--- debug.log tail (last 25) ---\n'
+    if [ -f "$sd/debug.log" ]; then tail -25 "$sd/debug.log"; else printf '(no debug log — run: khub track debug on, reproduce a session, then re-run doctor)\n'; fi
+    printf '```\n'
+  } | redact
+}
+
+# Delete ALL local telemetry — data store, config, hook, AND settings.json backups
+# (they hold the full tool config). Confirms first.
+track_purge() {
+  local settings; settings="$(tel_config_get settings_path 2>/dev/null || true)"
+  [ -n "$settings" ] || settings="$(tel_settings_path "$(tel_config_get scope 2>/dev/null || echo user)")"
+  printf '%s%s%s This DELETES all local telemetry — captures, metrics, reports, fingerprints, the\n' "$c_ylw" "$g_warn" "$c_reset"
+  printf '   debug log, khub'"'"'s hook + config, AND khub'"'"'s settings.json backups. Continue? [y/N] '
+  read -r ans; case "$ans" in [yY]*) : ;; *) die "aborted";; esac
+  track_disable >/dev/null 2>&1 || true                 # unregister hook + remove config/salt/cohort
+  rm -rf "$(tel_state_dir)" 2>/dev/null || true         # the whole local data store
+  rm -f "$(tel_dpa_token_file)" 2>/dev/null || true     # revoke external-export consent too
+  rm -f "${settings}".khub-bak-* 2>/dev/null || true    # backups hold the full tool config
+  ok "telemetry purged — hook removed, all local data + settings backups + consent deleted"
+}
+
+cmd_track() {
+  tel_prepare   # parent-scope: make embedded helpers available to the subshells below
+  local sub="${1:-status}"; if [ $# -gt 0 ]; then shift; fi
+  case "$sub" in
+    enable)  track_enable  "$@" ;;
+    disable) track_disable "$@" ;;
+    status)  track_status  "$@" ;;
+    repair)  track_repair  "$@" ;;
+    task)    track_task    "$@" ;;
+    debug)   track_debug   "$@" ;;
+    doctor)  track_doctor  "$@" ;;
+    purge)   track_purge   "$@" ;;
+    *) die "unknown track subcommand: $sub" "try: khub track enable|disable|status|repair|task|debug|doctor|purge" ;;
+  esac
+}
+
+# Package the setup-tagged metrics for sharing — metrics-only by default (grep-proof),
+# opt-in redacted snippets. Writes a local bundle to REVIEW; never uploads.
+cmd_export() {
+  local with_snippets=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-snippets) with_snippets=1; shift ;;
+      *) die "unknown option for export: $1" "try: khub export [--with-snippets]" ;;
+    esac
+  done
+  tel_prepare
+  local sd; sd="$(tel_state_dir)"
+  if [ ! -d "$sd/metrics" ]; then info "no telemetry to export yet"; hint "run 'khub track enable', finish a session, then export"; return 0; fi
+  local lib py; lib="$(tel_helper export_redact.py)" || die "could not materialize the telemetry helper" "reinstall khub"
+  py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required" "install python3"
+  local cohort salt login ts out
+  cohort="$([ -s "$(tel_cohort_file)" ] && head -1 "$(tel_cohort_file)" || echo unset)"
+  salt="$([ -s "$(tel_salt_file)" ] && head -1 "$(tel_salt_file)" || echo '')"
+  login="$(gh api user -q .login 2>/dev/null || true)"
+  ts="$(date +%Y%m%d-%H%M%S)"; out="$sd/export/$ts"
+  set -- --state "$sd" --out "$out" --cohort "$cohort" --home "$HOME"
+  [ -n "$salt" ] && set -- "$@" --salt "$salt"
+  [ -n "$login" ] && set -- "$@" --login "$login"
+  [ "$with_snippets" = "1" ] && set -- "$@" --with-snippets
+  if [ "$cohort" = "external" ]; then
+    set -- "$@" --dpa-token "$(tel_dpa_token_file)"
+    [ "$with_snippets" = "1" ] && set -- "$@" --exclude-tool-bodies   # default ON for external
+  fi
+  local rc=0; "$py" "$lib" "$@" || rc=$?
+  local extra=""; [ "$with_snippets" = "1" ] && extra=" + redacted snippets"
+  case "$rc" in
+    0) title "khub export"
+       ok "bundle written (metrics-only${extra})"
+       detail "$(tilde "$out")"
+       hint "REVIEW it before sharing — nothing was sent anywhere" ;;
+    6) die "external-cohort export is BLOCKED — no DPA consent token" \
+         "a named DPA owner must provision $(tilde "$(tel_dpa_token_file)") first" ;;
+    *) die "export failed (code $rc)" "run 'khub track doctor'" ;;
+  esac
+}
+
+# Show the most recent captured session's pre-rendered report (counts only — the
+# report carries no raw prompt/response text). `--by-task` totals output tokens per
+# ticket across ALL captured sessions instead.
+cmd_metrics() {
+  local by_task=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by-task) by_task=1; shift ;;
+      *) die "unknown option for metrics: $1" "try: khub metrics [--by-task]" ;;
+    esac
+  done
+  if [ "$by_task" = "1" ]; then
+    local mdir lib py; mdir="$(tel_state_dir)/metrics"
+    if [ ! -d "$mdir" ]; then info "no telemetry captured yet"; hint "run 'khub track enable', then finish a session"; return 0; fi
+    tel_prepare   # parent-scope: embedded helper available if there is no lib/
+    lib="$(tel_helper aggregate_tasks.py)" || die "could not materialize the telemetry helper" "reinstall khub"
+    py="$(tel_python3)"; [ -n "$py" ] || die "python3 is required" "install python3"
+    title "khub metrics — output tokens by task"
+    "$py" "$lib" "$mdir"
+    return 0
+  fi
+  local rdir; rdir="$(tel_state_dir)/report"
+  if [ ! -d "$rdir" ]; then
+    info "no telemetry captured yet"
+    hint "run 'khub track enable', then finish a Claude Code session"
+    return 0
+  fi
+  local f latest="" n=0
+  for f in "$rdir"/*.txt; do
+    [ -e "$f" ] || continue
+    n=$((n+1))
+    if [ -z "$latest" ] || [ "$f" -nt "$latest" ]; then latest="$f"; fi
+  done
+  if [ -z "$latest" ]; then
+    info "no telemetry reports yet"
+    hint "finish a Claude Code session with telemetry enabled"
+    return 0
+  fi
+  title "khub metrics — latest session"
+  cat "$latest"
+  say ""
+  local sd sid base; sd="$(tel_state_dir)"; sid="$(basename "$latest" .txt)"
+  # Collapse $HOME to ~ WITHOUT truncating (tilde() truncates) so paths stay copy-pastable.
+  base="$sd"; case "$base" in "$HOME"*) base="~${base#"$HOME"}" ;; esac
+  detail "${n} session(s) captured. everything is local, under:  ${base}/"
+  detail "  metrics/${sid}.json      metric report — counts only, export-safe"
+  detail "  report/${sid}.txt        rendered report (the printout above)"
+  detail "  fingerprint/${sid}.json  setup fingerprint (harness/model/cohort)"
+  detail "  capture/${sid}.jsonl     raw session log — full prompt+response text, local-only, auto-purged 14d"
+  [ -f "$sd/debug.log" ] && detail "  debug.log                hook activity log (from 'khub track debug on')"
+  detail "(the paths above are the LATEST session; each session has its own <id> files in the same dirs)"
+  hint "output tokens per ticket:  khub metrics --by-task"
+  hint "redacted status to share:  khub track doctor"
 }
 
 usage() {
@@ -274,12 +1043,30 @@ khub ${KHUB_VERSION} — clone and update a delivered knowledge-hub snapshot
 
 usage:
   khub init [dir]        clone the hub as a sibling under dir (default: current dir)
-  khub update [--path D] [--reset]
+  khub update [--path D] [--dry-run] [--reset]
                          update your hub CONTENT clone to the latest snapshot
-                         (--reset discards local changes, confirms first)
-  khub upgrade           update the khub CLI itself to the latest release
-  khub doctor [--path D] diagnose auth, access, sibling layout, and freshness
+                         (--dry-run previews without changing anything;
+                          --reset discards local changes, confirms first)
+  khub upgrade [--check] update the khub CLI itself to the latest release
+                         (--check only reports whether a newer release exists)
+  khub doctor [--path D] [--report]
+                         diagnose auth, access, sibling layout, and freshness
+                         (--report appends a redacted, paste-ready diagnostic)
   khub version [--path D] print the CLI version and the clone's latest snapshot
+  khub track <enable|disable|status|repair|task|debug|doctor|purge>
+                         opt-in, LOCAL-ONLY session telemetry (OFF by default)
+                         (enable [--project] [--cohort internal|external] registers a
+                          hook in settings.json, backing it up first; disable removes
+                          only khub's entries; task <id> books tokens to a ticket;
+                          debug on|off toggles a log; doctor prints a redacted report;
+                          purge deletes all local data + config + settings backups)
+  khub metrics [--by-task]
+                         show the latest session's local report (counts only), or
+                         --by-task to total output tokens per ticket across sessions
+  khub export [--with-snippets]
+                         write a redacted, review-before-send bundle of the metrics
+                         (metrics-only + grep-proof by default; --with-snippets adds
+                          redacted prompt/response text). Nothing is ever uploaded.
   khub help              this message
 
 Note: 'update' refreshes the delivered hub content; 'upgrade' updates this tool.
@@ -290,6 +1077,1282 @@ pulls but the history already on your machine remains.
 EOF
 }
 
+# >>> BEGIN embedded telemetry helpers (generated by scripts/embed-telemetry.py) >>>
+# DO NOT EDIT BY HAND — regenerate with: python3 scripts/embed-telemetry.py
+# Source of truth: lib/telemetry/*.py
+_khub_py_settings_merge() {
+cat <<'KHUB_EMBEDDED_PY_EOF'
+#!/usr/bin/env python3
+"""khub telemetry settings.json merge helper.
+
+All JSON manipulation for `khub track` lives here so the khub CLI (bash) never
+parses JSON itself. This is the highest-consequence surface in the telemetry
+feature — a bad merge corrupts the engineer's Claude Code config — so every write
+is:
+
+  * NON-DESTRUCTIVE   only khub's own entries (marked ``_khub``) are added/removed;
+                      co-existing hooks from ClaudeKit or anything else are never
+                      touched, and entries are matched by an explicit marker key,
+                      never by list position or a command substring (spoofable).
+  * IDEMPOTENT        N enables leave exactly one khub block per event.
+  * ATOMIC + MODE-SAFE  write to a temp file in the same dir, preserve the
+                      original's permission bits (no 0600->0644 widening), fsync,
+                      then os.replace(); a timestamped 0600 backup is kept first.
+  * FLOCK + RACE-GUARDED  an exclusive lock serialises concurrent `khub track`
+                      runs; the file's (mtime,size) is re-checked immediately
+                      before the rename so a write by another process (an IDE
+                      editing settings.json live) aborts instead of clobbering.
+  * FAIL-CLOSED       malformed JSON or an unwritable target aborts with a clear
+                      message and NO mutation.
+
+Subcommands (the khub CLI is the only caller):
+
+  enable  <settings_path> --version N --command CMD
+  disable <settings_path>
+  status  <settings_path> [--command CMD]      # prints start=/end=/drift= lines
+
+Exit codes: 0 ok · 2 usage · 3 malformed/uncooperative JSON · 4 not writable ·
+5 changed under us (caller may retry once).
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+
+# khub identifies its OWN hook entries by the stable path token in the registered
+# command — NOT by an extra key in the entry. The Claude Code settings schema marks
+# the hook-matcher object ``additionalProperties: false`` (only ``matcher``/``hooks``
+# are allowed), so an in-band marker key would be schema-invalid: editor validators
+# flag it, and a settings re-serialization by the config UI could silently strip it,
+# breaking identity (duplicate-on-re-enable, orphan-on-disable). The command khub
+# writes always runs ``<abs-python3> <XDG_DATA>/khub-telemetry/capture_hook.py`` — that
+# path segment is khub's exclusive namespace, so matching it is both schema-clean and,
+# for a path under khub's own data dir, not realistically forgeable or collision-prone.
+HOOK_TOKEN = "khub-telemetry/capture_hook.py"
+EVENTS = ("SessionStart", "SessionEnd")
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_MALFORMED = 3
+EXIT_NOTWRITABLE = 4
+EXIT_RACE = 5
+
+
+class _RaceError(Exception):
+    """The target changed between our read and the rename — the caller retries."""
+
+
+# ---- load / identity --------------------------------------------------------
+def load_settings(path):
+    """Return (obj, existed). An absent or empty file is an empty object.
+
+    Raises ValueError on malformed JSON so the caller can fail closed.
+    """
+    if not os.path.exists(path):
+        return {}, False
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if text.strip() == "":
+        return {}, True
+    return json.loads(text), True  # JSONDecodeError is a ValueError subclass
+
+
+def _entry_commands(entry):
+    if not isinstance(entry, dict):
+        return []
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return []
+    return [h.get("command", "") for h in hooks if isinstance(h, dict)]
+
+
+def is_khub_entry(entry):
+    """khub's own entry: one of its hook commands references khub's hook path."""
+    return any(HOOK_TOKEN in cmd for cmd in _entry_commands(entry))
+
+
+def make_entry(command):
+    # Schema-clean: exactly the {matcher?, hooks} the hookMatcher object permits — no
+    # extra keys. No matcher => broadest firing intent (whether a matcher-less
+    # SessionStart fires for every source is a live-session question for Phase 2).
+    # Identity is carried by the command path (HOOK_TOKEN), not a marker key.
+    return {"hooks": [{"type": "command", "command": command}]}
+
+
+def _sig(path):
+    """A cheap change-signature (mtime_ns, size) for the race guard, or None."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+# ---- mutation primitives ----------------------------------------------------
+def strip_khub(cfg):
+    """Remove every khub-marked entry from every event array. Non-khub entries
+    (and now-empty arrays that we emptied) are left exactly as they were."""
+    hooks = cfg.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    for event in list(hooks.keys()):
+        arr = hooks[event]
+        if isinstance(arr, list):
+            arr[:] = [e for e in arr if not is_khub_entry(e)]
+
+
+def add_khub(cfg, command):
+    """Add khub's block to each telemetry event, replacing any prior khub block
+    (idempotent). Raises ValueError if the existing shape is hostile."""
+    hooks = cfg.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings.json 'hooks' is not an object")
+    for event in EVENTS:
+        arr = hooks.setdefault(event, [])
+        if not isinstance(arr, list):
+            raise ValueError("settings.json 'hooks.%s' is not an array" % event)
+        arr[:] = [e for e in arr if not is_khub_entry(e)]
+        arr.append(make_entry(command))
+
+
+def backup(path):
+    """Copy an existing, non-empty settings.json to a 0600 timestamped backup,
+    verify it landed, then prune to the last two."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return
+    bak = "%s.khub-bak-%d" % (path, int(time.time()))
+    fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as dst, open(path, "rb") as src:
+        data = src.read()
+        dst.write(data)
+    if data and os.path.getsize(bak) == 0:
+        raise IOError("backup verification failed: %s" % bak)
+    prune_backups(path)
+
+
+def prune_backups(path, keep=2):
+    baks = sorted(glob.glob(glob.escape(path) + ".khub-bak-*"))
+    for old in baks[:-keep]:
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+
+
+def atomic_write(path, obj, existed, expected_sig=None):
+    """Serialise obj to path via temp+rename, preserving the original mode.
+
+    If expected_sig is given, the target's (mtime,size) is re-checked in the last
+    instant before os.replace and a mismatch raises _RaceError — closing the
+    check-to-rename window where another writer (e.g. an IDE editing settings.json
+    live) would otherwise be clobbered with our stale copy."""
+    directory = os.path.dirname(path) or "."
+    if existed and os.path.exists(path):
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    else:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".khub-settings.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        if expected_sig is not None and _sig(path) != expected_sig:
+            raise _RaceError()
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def with_lock(path, func):
+    """Run func() while holding an exclusive lock on a sibling lockfile, so two
+    concurrent `khub track` runs cannot interleave a read-modify-write."""
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        pass
+    lock = "%s.khub-lock" % path
+    lf = open(lock, "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        return func()
+    finally:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            lf.close()
+        # The lockfile is intentionally NOT unlinked: unlinking lets a later opener
+        # create a fresh inode and lock THAT instead, so two processes would run
+        # concurrently and mutual exclusion would silently break. It is a 0-byte
+        # sibling; `khub track disable`/`purge` remove it.
+
+
+# ---- subcommands ------------------------------------------------------------
+def _writable_target(path, existed):
+    directory = os.path.dirname(path) or "."
+    if existed and not os.access(path, os.W_OK):
+        sys.stderr.write("settings.json is not writable: %s\n" % path)
+        return False
+    if not os.path.isdir(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            sys.stderr.write("cannot create directory: %s\n" % directory)
+            return False
+    if not os.access(directory, os.W_OK):
+        sys.stderr.write("directory is not writable: %s\n" % directory)
+        return False
+    return True
+
+
+def cmd_enable(args):
+    def op():
+        try:
+            obj, existed = load_settings(args.path)
+        except ValueError:
+            sys.stderr.write("settings.json is not valid JSON: %s\n" % args.path)
+            return EXIT_MALFORMED
+        if not isinstance(obj, dict):
+            sys.stderr.write("settings.json top-level is not an object: %s\n" % args.path)
+            return EXIT_MALFORMED
+        if not _writable_target(args.path, existed):
+            return EXIT_NOTWRITABLE
+        pre = _sig(args.path) if existed else None
+        try:
+            add_khub(obj, args.command)
+        except ValueError as exc:
+            sys.stderr.write("%s\n" % exc)
+            return EXIT_MALFORMED
+        if existed and _sig(args.path) != pre:
+            sys.stderr.write("settings.json changed during update — retry\n")
+            return EXIT_RACE
+        backup(args.path)
+        try:
+            atomic_write(args.path, obj, existed, expected_sig=pre)
+        except _RaceError:
+            sys.stderr.write("settings.json changed during update — retry\n")
+            return EXIT_RACE
+        return EXIT_OK
+
+    return with_lock(args.path, op)
+
+
+def cmd_disable(args):
+    def op():
+        if not os.path.exists(args.path):
+            return EXIT_OK
+        try:
+            obj, existed = load_settings(args.path)
+        except ValueError:
+            sys.stderr.write("settings.json is not valid JSON: %s\n" % args.path)
+            return EXIT_MALFORMED
+        if not isinstance(obj, dict):
+            return EXIT_OK
+        if not _writable_target(args.path, existed):
+            return EXIT_NOTWRITABLE
+        pre = _sig(args.path)
+        strip_khub(obj)
+        if _sig(args.path) != pre:
+            sys.stderr.write("settings.json changed during update — retry\n")
+            return EXIT_RACE
+        backup(args.path)
+        try:
+            atomic_write(args.path, obj, True, expected_sig=pre)
+        except _RaceError:
+            sys.stderr.write("settings.json changed during update — retry\n")
+            return EXIT_RACE
+        return EXIT_OK
+
+    return with_lock(args.path, op)
+
+
+def cmd_status(args):
+    result = {"start": "missing", "end": "missing", "drift": "none"}
+    if os.path.exists(args.path):
+        try:
+            obj, _ = load_settings(args.path)
+        except ValueError:
+            sys.stdout.write("start=missing\nend=missing\ndrift=malformed\n")
+            return EXIT_OK
+        if not isinstance(obj, dict):
+            obj = {}
+        hooks = obj.get("hooks")
+        hooks = hooks if isinstance(hooks, dict) else {}
+        drift = False
+        for event, key in (("SessionStart", "start"), ("SessionEnd", "end")):
+            arr = hooks.get(event, [])
+            arr = arr if isinstance(arr, list) else []
+            entries = [e for e in arr if is_khub_entry(e)]
+            if entries:
+                result[key] = "present"
+                if args.command is not None:
+                    commands = [
+                        h.get("command")
+                        for e in entries
+                        for h in e.get("hooks", [])
+                        if isinstance(h, dict)
+                    ]
+                    if args.command not in commands:
+                        drift = True
+            elif args.command is not None:
+                # An expected event with no khub entry is drift the caller repairs.
+                drift = True
+        if drift:
+            result["drift"] = "yes"
+    sys.stdout.write(
+        "start=%s\nend=%s\ndrift=%s\n" % (result["start"], result["end"], result["drift"])
+    )
+    return EXIT_OK
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="settings_merge.py", add_help=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_en = sub.add_parser("enable")
+    p_en.add_argument("path")
+    p_en.add_argument("--command", required=True)
+    p_en.set_defaults(func=cmd_enable)
+
+    p_dis = sub.add_parser("disable")
+    p_dis.add_argument("path")
+    p_dis.set_defaults(func=cmd_disable)
+
+    p_st = sub.add_parser("status")
+    p_st.add_argument("path")
+    p_st.add_argument("--command", default=None)
+    p_st.set_defaults(func=cmd_status)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+KHUB_EMBEDDED_PY_EOF
+}
+_khub_py_capture_hook() {
+cat <<'KHUB_EMBEDDED_PY_EOF'
+#!/usr/bin/env python3
+"""khub telemetry capture hook — SessionEnd rollup.
+
+`khub track enable` registers this under SessionStart + SessionEnd in
+~/.claude/settings.json. On **SessionEnd** (once per session — NOT Stop, which fires
+per turn and would overwrite the record ~50x with partial data) it reads the session
+transcript, extracts process metrics, and writes three local-first files keyed off the
+hook-stdin session_id (== the transcript filename stem):
+
+  <XDG_STATE>/khub-telemetry/metrics/<id>.json   export-safe: counts only, NO raw text
+  <XDG_STATE>/khub-telemetry/capture/<id>.jsonl  raw turn pairs (local-only, truncated)
+  <XDG_STATE>/khub-telemetry/report/<id>.txt      a pre-rendered human summary
+
+FAIL-OPEN CONTRACT (do not weaken): a SessionEnd hook that exits non-zero blocks the
+turn, and a missing interpreter yields 127. So this script takes NO argparse (reads
+everything from stdin), skips any unparseable transcript line, and ALWAYS exits 0 —
+even on malformed stdin, an absent transcript, or an internal exception. The command
+khub registers is additionally guarded with ``|| exit 0``.
+
+Determinism: every metric derives from the transcript alone (no wall-clock now), and
+metrics/report are written with sorted keys, so re-parsing a transcript is byte-stable.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import platform
+import sys
+from datetime import datetime
+
+SCHEMA_VERSION = 1
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+SUBAGENT_TOOLS = ("Agent", "Task")
+REWORK_MIN = 3            # a file edited >= this many times = a rework/churn signal
+SHORT_PROMPT_MAX = 40     # a short, non-first prompt ~ a correction/clarification
+TRUNC = 2000              # cap raw prompt/response text stored locally
+# SDK/automation surfaces excluded from the population — interactive work is cli/ide/
+# web. Matched by PREFIX so every sdk-* variant is dropped (sdk-ts, sdk-cli, …): a
+# real transcript surfaced entrypoint "sdk-cli" (a synthetic, 0-token invocation) that
+# an exact "sdk-ts" match let slip through and pollute the store.
+DROP_ENTRYPOINT_PREFIXES = ("sdk-",)
+SYNTHETIC_MODEL = "<synthetic>"  # a non-LLM synthetic turn — never real interactive work
+RETAIN_DAYS = 14          # raw capture auto-purge age
+CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits first
+DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
+
+
+# ---- paths / gating ---------------------------------------------------------
+def _config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "khub", "telemetry.conf")
+
+
+def _state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "khub-telemetry")
+
+
+def _enabled():
+    try:
+        with open(_config_path(), encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() == "enabled=1":
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _task_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "khub", "telemetry-task")
+
+
+def _active_task():
+    """The manually-set ticket id (`khub track task <id>`), or None to fall back to
+    git-branch attribution."""
+    try:
+        with open(_task_path(), encoding="utf-8") as fh:
+            t = fh.readline().strip()
+            return t or None
+    except Exception:
+        return None
+
+
+def _config_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "khub")
+
+
+def _read_salt():
+    """Per-install random salt (written by `khub track enable`). Identity fields are
+    HMAC'd with it so the aggregator cannot reverse a guessable input (a cwd/remote/
+    skill name) — hashing guessable inputs without a secret salt is NOT anonymisation."""
+    try:
+        with open(os.path.join(_config_dir(), "telemetry-salt"), encoding="utf-8") as fh:
+            s = fh.readline().strip()
+            return s or None
+    except Exception:
+        return None
+
+
+def _read_cohort():
+    try:
+        with open(os.path.join(_config_dir(), "telemetry-cohort"), encoding="utf-8") as fh:
+            c = fh.readline().strip()
+            return c or "unset"
+    except Exception:
+        return "unset"
+
+
+def _debug_on():
+    return os.path.exists(os.path.join(_config_dir(), "telemetry-debug"))
+
+
+def _debug(event, sid, outcome, detail=""):
+    """Append one line to the opt-in debug log documenting WHAT the fail-open hook did
+    and why — the only visibility into a hook that otherwise swallows every error.
+    Redacted BY CONSTRUCTION: event + a short session-id prefix + an outcome label +
+    counts/labels only (never a prompt, path, or exception message). Never raises."""
+    if not _debug_on():
+        return
+    try:
+        state = _state_dir()
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        log = os.path.join(state, "debug.log")
+        sid8 = sid[:8] if isinstance(sid, str) and sid else "-"
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("%s %-12s %-8s %-14s %s\n" % (ts, event or "-", sid8, outcome, detail))
+        with open(log, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        if len(lines) > DEBUG_LOG_MAX_LINES:
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-DEBUG_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def _salted(salt_hex, value):
+    """Keyed HMAC-SHA256 (truncated) of a value, or None if unsalted/absent. Stored
+    instead of the raw value so a skill name / repo path never leaves as plaintext."""
+    if not salt_hex or value is None or value == "":
+        return None
+    try:
+        key = bytes.fromhex(salt_hex)
+    except (ValueError, TypeError):
+        key = salt_hex.encode("utf-8")
+    try:
+        return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+# ---- transcript helpers -----------------------------------------------------
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _is_tool_result_envelope(content):
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+    )
+
+
+def _epoch(ts):
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _num(x):
+    """int(x), or 0 on anything non-numeric — token fields must never raise."""
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dropped_surface(entrypoint):
+    """True for SDK/automation surfaces (any sdk-* entrypoint) — excluded from the
+    interactive-work population."""
+    e = entrypoint or ""
+    return any(e.startswith(p) for p in DROP_ENTRYPOINT_PREFIXES)
+
+
+def _blocks(msg):
+    c = msg.get("content") if isinstance(msg, dict) else None
+    return c if isinstance(c, list) else []
+
+
+def _zero_tokens():
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+
+
+def parse_transcript(path, manual_task=None):
+    """Single streaming pass → (metrics dict, entrypoint, raw_turns). Parsed
+    defensively: an unparseable line is skipped, and each field is read with a safe
+    fallback (non-numeric tokens → 0, non-string keys → "unknown"/"?"), so a future
+    transcript-schema drift degrades gracefully instead of dropping the whole
+    session's metrics.
+
+    Token attribution: if manual_task is set (`khub track task <id>`) the whole
+    session's tokens are booked to that ticket; otherwise they are split by the
+    git branch each turn ran on (one-branch-per-ticket workflows get this free)."""
+    tool_calls = {}
+    tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    tokens_by_branch = {}           # gitBranch -> token dict (for auto attribution)
+    model = None                    # first assistant model seen (for the setup fingerprint)
+    edits = {}                      # file_path -> count
+    prompts = 0
+    slash = 0
+    corrections = 0
+    error_retries = 0
+    subagents = {}                  # subagent_type -> count
+    subagents_total = 0
+    ts_min = ts_max = None
+    entrypoint = None
+    pending_error = False           # an error tool_result awaiting a retry tool_use
+    raw_turns = []
+    cur = None                      # current turn being assembled for raw capture
+
+    def flush():
+        if cur is not None:
+            raw_turns.append(cur)
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            # duration spans EVERY timestamped line (sidechain/meta included)
+            e = _epoch(obj.get("timestamp"))
+            if e is not None:
+                ts_min = e if ts_min is None else min(ts_min, e)
+                ts_max = e if ts_max is None else max(ts_max, e)
+            if entrypoint is None and obj.get("entrypoint"):
+                entrypoint = obj.get("entrypoint")
+            if obj.get("isSidechain") is True:
+                continue            # subagent line — excluded from the population's metrics
+            t = obj.get("type")
+            msg = obj.get("message")
+
+            if t == "assistant" and isinstance(msg, dict):
+                if model is None:
+                    mv = msg.get("model")
+                    if isinstance(mv, str) and mv:
+                        model = mv
+                usage = msg.get("usage")
+                if isinstance(usage, dict):
+                    ui = _num(usage.get("input_tokens"))
+                    uo = _num(usage.get("output_tokens"))
+                    ur = _num(usage.get("cache_read_input_tokens"))
+                    uc = _num(usage.get("cache_creation_input_tokens"))
+                    tokens["input"] += ui
+                    tokens["output"] += uo
+                    tokens["cache_read"] += ur
+                    tokens["cache_creation"] += uc
+                    br = obj.get("gitBranch")
+                    br = br if isinstance(br, str) and br else "unknown"
+                    bt = tokens_by_branch.setdefault(br, _zero_tokens())
+                    bt["input"] += ui
+                    bt["output"] += uo
+                    bt["cache_read"] += ur
+                    bt["cache_creation"] += uc
+                for b in _blocks(msg):
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        name = b.get("name")
+                        name = name if isinstance(name, str) and name else "?"
+                        tool_calls[name] = tool_calls.get(name, 0) + 1
+                        if pending_error:
+                            error_retries += 1
+                            pending_error = False
+                        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                        if name in EDIT_TOOLS:
+                            fp = inp.get("file_path") or inp.get("notebook_path")
+                            if isinstance(fp, str) and fp:
+                                edits[fp] = edits.get(fp, 0) + 1
+                        if name in SUBAGENT_TOOLS:
+                            subagents_total += 1
+                            st = inp.get("subagent_type")
+                            st = st if isinstance(st, str) and st else "unknown"
+                            subagents[st] = subagents.get(st, 0) + 1
+                        if cur is not None:
+                            cur["tools"].append(name)
+                    elif b.get("type") == "text" and cur is not None:
+                        cur["response"] = (cur["response"] + str(b.get("text", "")))[:TRUNC]
+
+            elif t == "user" and isinstance(msg, dict):
+                content = msg.get("content")
+                if _is_tool_result_envelope(content):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error") is True:
+                            pending_error = True
+                    continue
+                if obj.get("isMeta") is True:
+                    continue
+                text = _text_of(content).strip()
+                if not text:
+                    continue
+                prompts += 1
+                is_slash = text.startswith("/")
+                if is_slash:
+                    slash += 1
+                # a short, non-first prompt that is NOT a slash command ~ a correction
+                if prompts > 1 and not is_slash and len(text) <= SHORT_PROMPT_MAX:
+                    corrections += 1
+                flush()
+                cur = {"ts": obj.get("timestamp"), "prompt": text[:TRUNC],
+                       "response": "", "tools": []}
+    flush()
+
+    distinct = len(edits)
+    reworked = sum(1 for n in edits.values() if n >= REWORK_MIN)
+    duration = int(round((ts_max - ts_min))) if (ts_min is not None and ts_max is not None) else 0
+    # Token attribution → per ticket. Manual tag books the whole session to that
+    # ticket; otherwise split by git branch (the dominant branch names the session).
+    if manual_task:
+        task = manual_task
+        tokens_by_task = {manual_task: dict(tokens)}
+    elif tokens_by_branch:
+        tokens_by_task = tokens_by_branch
+        task = max(tokens_by_branch, key=lambda b: tokens_by_branch[b]["output"])
+    else:
+        task = "unknown"
+        tokens_by_task = {}
+    metrics = {
+        "schema_version": SCHEMA_VERSION,
+        "entrypoint": entrypoint or "unknown",
+        "duration_seconds": duration,
+        "prompts": prompts,
+        "turns": prompts,
+        "model": model,
+        "task": task,
+        "tokens_by_task": tokens_by_task,
+        "tool_calls_total": sum(tool_calls.values()),
+        "tool_calls": tool_calls,
+        "tokens": tokens,
+        "edits": {"total": sum(edits.values()), "distinct_files": distinct, "reworked_files": reworked},
+        "error_retries": error_retries,
+        "subagents": {"total": subagents_total, "types": subagents},
+        "slash_commands": slash,
+        "user_corrections": corrections,
+    }
+    return metrics, (entrypoint or "unknown"), raw_turns
+
+
+# ---- output -----------------------------------------------------------------
+def _atomic_write(path, text, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def render_report(session_id, m):
+    tc = ", ".join("%s %d" % (k, m["tool_calls"][k]) for k in sorted(m["tool_calls"]))
+    st = ", ".join("%s %d" % (k, m["subagents"]["types"][k]) for k in sorted(m["subagents"]["types"]))
+    tk = m["tokens"]
+    lines = [
+        "khub telemetry — session %s" % session_id,
+        "task: %s · output tokens: %d" % (m.get("task", "unknown"), tk["output"]),
+        "entrypoint: %s · duration: %ds · prompts: %d · turns: %d"
+        % (m["entrypoint"], m["duration_seconds"], m["prompts"], m["turns"]),
+        "tools: %d total (%s)" % (m["tool_calls_total"], tc or "none"),
+        "tokens: in %d / out %d / cache-read %d / cache-create %d"
+        % (tk["input"], tk["output"], tk["cache_read"], tk["cache_creation"]),
+        "edits: %d (%d files, %d reworked)"
+        % (m["edits"]["total"], m["edits"]["distinct_files"], m["edits"]["reworked_files"]),
+        "errors→retries: %d · subagents: %d (%s)" % (m["error_retries"], m["subagents"]["total"], st or "none"),
+        "slash-commands: %d · user-corrections: %d" % (m["slash_commands"], m["user_corrections"]),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def purge_old_captures(cap_dir):
+    """Best-effort retention: drop raw capture files older than RETAIN_DAYS, then
+    enforce a total-size cap by removing the oldest. Never raises."""
+    try:
+        import time
+        files = []
+        for name in os.listdir(cap_dir):
+            fp = os.path.join(cap_dir, name)
+            if os.path.isfile(fp):
+                files.append((os.stat(fp).st_mtime, os.path.getsize(fp), fp))
+        now = time.time()
+        cutoff = now - RETAIN_DAYS * 86400
+        kept = []
+        for mtime, size, fp in files:
+            if mtime < cutoff:
+                try:
+                    os.unlink(fp)
+                except OSError:
+                    pass
+            else:
+                kept.append((mtime, size, fp))
+        total = sum(s for _, s, _ in kept)
+        for mtime, size, fp in sorted(kept):   # oldest first
+            if total <= CAPTURE_CAP_BYTES:
+                break
+            try:
+                os.unlink(fp)
+                total -= size
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+# ---- setup fingerprint (SessionStart) --------------------------------------
+# Tags each session with the SETUP it ran under — the independent variable for
+# "which way of working wins". Portable (pure filesystem/env, no ClaudeKit APIs);
+# identity fields are salted hashes / counts, never raw names or paths.
+def _detect_setup(cwd):
+    claude = os.path.join(cwd, ".claude") if cwd else None
+    has_claude = bool(claude) and os.path.isdir(claude)
+    has_rules = has_claude and os.path.isdir(os.path.join(claude, "rules"))
+    skills = []
+    if has_claude and os.path.isdir(os.path.join(claude, "skills")):
+        try:
+            skills = sorted(d for d in os.listdir(os.path.join(claude, "skills"))
+                            if os.path.isdir(os.path.join(claude, "skills", d)))
+        except OSError:
+            skills = []
+    if not has_claude:
+        harness = "vanilla"
+    elif has_rules and skills:
+        harness = "claudekit"
+    elif has_rules or skills:
+        harness = "custom"
+    else:
+        harness = "vanilla"          # .claude exists but no rules/skills (e.g. just settings.json)
+    return harness, has_rules, skills
+
+
+def _rules_text(cwd):
+    for rel in ("CLAUDE.md", os.path.join(".claude", "rules", "CLAUDE.md")):
+        try:
+            with open(os.path.join(cwd, rel), encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception:
+            continue
+    return None
+
+
+def _repo_ident(cwd):
+    """Stable repo id: the git remote url if readable, else the cwd path. Stored ONLY
+    as a salted hash (never raw)."""
+    try:
+        with open(os.path.join(cwd, ".git", "config"), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("url = "):
+                    return s[6:].strip()
+    except Exception:
+        pass
+    return cwd
+
+
+def _hub_present(cwd):
+    if not cwd:
+        return False
+    for rel in ("knowledge-hub", os.path.join("..", "knowledge-hub")):
+        if os.path.isdir(os.path.join(cwd, rel, ".knowledge")):
+            return True
+    return False
+
+
+def build_fingerprint(session_id, cwd, surface):
+    salt = _read_salt()
+    harness, has_rules, skills = _detect_setup(cwd)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id,
+        "harness": harness,
+        "surface": surface or "unknown",
+        "os": "%s %s" % (platform.system(), platform.machine()),
+        "python": platform.python_version(),
+        "model": None,               # filled from the transcript at the SessionEnd merge
+        "skills_count": len(skills),
+        "rules_present": has_rules,
+        "rules_hash": _salted(salt, _rules_text(cwd)),
+        "skills_hash": _salted(salt, ",".join(skills)) if skills else None,
+        "hub_present": _hub_present(cwd),
+        "repo_id": _salted(salt, _repo_ident(cwd)),
+        "cohort": _read_cohort(),
+        "has_salt": bool(salt),
+    }
+
+
+def write_fingerprint(payload):
+    sid = payload.get("session_id")
+    if not sid:
+        _debug("SessionStart", sid, "no-session-id")
+        return
+    surface = payload.get("entrypoint") or "unknown"
+    if _dropped_surface(surface):
+        _debug("SessionStart", sid, "dropped-sdk", surface)
+        return                       # don't fingerprint automation sessions either
+    cwd = payload.get("cwd") or os.getcwd()
+    fp = build_fingerprint(sid, cwd, surface)
+    _atomic_write(os.path.join(_state_dir(), "fingerprint", "%s.json" % sid),
+                  json.dumps(fp, sort_keys=True, indent=2) + "\n")
+    _debug("SessionStart", sid, "ok", "harness=%s salt=%s" % (fp["harness"], fp["has_salt"]))
+
+
+def _read_fingerprint(session_id):
+    try:
+        with open(os.path.join(_state_dir(), "fingerprint", "%s.json" % session_id), encoding="utf-8") as fh:
+            fp = json.load(fh)
+        return fp if isinstance(fp, dict) else None
+    except Exception:
+        return None
+
+
+def rollup(session_id, transcript_path):
+    if not session_id or not transcript_path or not os.path.isfile(transcript_path):
+        _debug("SessionEnd", session_id, "no-transcript")
+        return
+    metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
+    if _dropped_surface(entrypoint):
+        _debug("SessionEnd", session_id, "dropped-sdk", entrypoint)
+        return                       # automation surface — excluded from the population
+    if metrics.get("model") == SYNTHETIC_MODEL:
+        _debug("SessionEnd", session_id, "dropped-synthetic")
+        return                       # a synthetic (non-LLM) session — not real work
+    metrics["session_id"] = session_id
+    fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
+    if fp is not None:
+        fp = dict(fp)
+        if not fp.get("model"):
+            fp["model"] = metrics.get("model")
+        if fp.get("surface") in (None, "", "unknown"):
+            fp["surface"] = metrics.get("entrypoint")
+        metrics["setup"] = fp
+    state = _state_dir()
+    _atomic_write(os.path.join(state, "metrics", "%s.json" % session_id),
+                  json.dumps(metrics, sort_keys=True, indent=2) + "\n")
+    _atomic_write(os.path.join(state, "report", "%s.txt" % session_id),
+                  render_report(session_id, metrics))
+    cap = os.path.join(state, "capture", "%s.jsonl" % session_id)
+    _atomic_write(cap, "".join(json.dumps(t, sort_keys=True) + "\n" for t in raw_turns))
+    purge_old_captures(os.path.join(state, "capture"))
+    _debug("SessionEnd", session_id, "ok",
+           "prompts=%d tools=%d out=%d setup=%s"
+           % (metrics["prompts"], metrics["tool_calls_total"], metrics["tokens"]["output"],
+              "yes" if "setup" in metrics else "no"))
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        _debug("?", None, "bad-stdin")
+        return
+    event = payload.get("hook_event_name")
+    sid = payload.get("session_id")
+    if not _enabled():
+        _debug(event, sid, "gated-off")   # logged even when off, to reveal that state
+        return
+    try:
+        if event == "SessionStart":
+            write_fingerprint(payload)
+        elif event == "SessionEnd":
+            rollup(sid, payload.get("transcript_path"))
+        else:
+            _debug(event, sid, "ignored-event")
+    except Exception as exc:
+        _debug(event, sid, "error", type(exc).__name__)   # type only — never the message
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        pass
+    sys.exit(0)
+KHUB_EMBEDDED_PY_EOF
+}
+_khub_py_aggregate_tasks() {
+cat <<'KHUB_EMBEDDED_PY_EOF'
+#!/usr/bin/env python3
+"""Aggregate output tokens per task/ticket across all captured sessions.
+
+Reads every `metrics/<id>.json` (each carries `tokens_by_task: {task: {output,
+input, ...}}`) and prints a descending table of total tokens per task. This is how
+`khub metrics --by-task` answers "how many tokens did ticket X cost across however
+many sessions it took". Read-only; a bad/absent file is skipped, never fatal.
+"""
+import json
+import os
+import sys
+
+
+def main():
+    mdir = sys.argv[1] if len(sys.argv) > 1 else "."
+    totals = {}   # task -> {output, input, sessions}
+    try:
+        names = sorted(os.listdir(mdir))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(mdir, name), encoding="utf-8") as fh:
+                m = json.load(fh)
+        except Exception:
+            continue
+        tbt = m.get("tokens_by_task")
+        if not isinstance(tbt, dict):
+            continue
+        for task, tok in tbt.items():
+            if not isinstance(tok, dict):
+                continue
+            agg = totals.setdefault(str(task), {"output": 0, "input": 0, "sessions": 0})
+            try:
+                agg["output"] += int(tok.get("output", 0) or 0)
+                agg["input"] += int(tok.get("input", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            agg["sessions"] += 1
+
+    if not totals:
+        print("  no task attribution yet — run some sessions with telemetry enabled")
+        return
+    rows = sorted(totals.items(), key=lambda kv: kv[1]["output"], reverse=True)
+    width = max((len(t) for t, _ in rows), default=4)
+    for task, a in rows:
+        print("  %-*s   out %d · in %d   (%d session%s)"
+              % (width, task, a["output"], a["input"], a["sessions"],
+                 "" if a["sessions"] == 1 else "s"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+KHUB_EMBEDDED_PY_EOF
+}
+_khub_py_export_redact() {
+cat <<'KHUB_EMBEDDED_PY_EOF'
+#!/usr/bin/env python3
+"""khub telemetry export + redaction.
+
+Package setup-tagged metrics for sharing WITHOUT leaking. Two safety tiers:
+
+  * DEFAULT (metrics only): an ALLOWLIST of known-safe fields — counts, a public
+    model id, and the already-salted setup fingerprint. Unrecognised fields are
+    dropped (fail-closed), `mcp__…` tool names are hashed (they reveal a client's
+    installed toolchain), and for the EXTERNAL cohort task/branch labels are hashed
+    too. Every string leaf is still run through the secret scrubber as defence in
+    depth. Result is grep-proof: no raw prompt/response text, no $HOME, no login, no
+    raw repo id, no secret.
+  * --with-snippets (opt-in, high-touch): raw prompt/response text from the local
+    capture, run through the scrubber ($HOME→~, login→<user>, and a secret-pattern
+    inventory). Fail-closed: a line that can't be processed is skipped.
+
+The EXTERNAL cohort is HARD-BLOCKED without an org-provisioned DPA consent token —
+export refuses to run (exit 6). This contradicts khub's pull-only trust model on
+purpose and needs a named owner's sign-off; the token is that machine-enforced gate.
+
+Nothing is ever uploaded — the bundle is written locally for the engineer to review.
+"""
+import argparse
+import glob
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_EXTERNAL_BLOCKED = 6
+
+# Only these top-level metric fields are ever exported; anything else is dropped.
+SAFE_TOP = (
+    "schema_version", "session_id", "entrypoint", "duration_seconds", "prompts",
+    "turns", "model", "tool_calls_total", "tool_calls", "tokens", "edits",
+    "error_retries", "subagents", "slash_commands", "user_corrections", "task",
+    "tokens_by_task", "setup",
+)
+
+# A best-effort secret inventory for the OPT-IN snippet path (metrics-only default is
+# the real safety net). PEM matches the WHOLE block so the key body cannot survive
+# behind a redaction marker; the token patterns cover current real-world formats
+# (sk-proj-…, github_pat_…, xoxb-…, AIza…, sk_live_…) that a naive prefix misses.
+SECRET_PATTERNS = [
+    ("gh-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("github-pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
+    ("slack-token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("google-key", re.compile(r"AIza[A-Za-z0-9_-]{20,}")),
+    ("stripe-key", re.compile(r"\b[srp]k_(?:live|test)_[A-Za-z0-9]{16,}")),
+    ("openai-key", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
+    ("aws-key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("pem", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL)),
+    ("bearer", re.compile(r"[Bb]earer\s+[A-Za-z0-9._~+/=-]{16,}")),
+    ("url-creds", re.compile(r"://[^/@\s:]+:[^/@\s]+@")),
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("secret-assign", re.compile(r"\b[A-Z][A-Z0-9_]{2,}=[^\s\"']{8,}")),
+]
+# Collapse a home-directory path shape even when it is not the runtime $HOME (F8:
+# a client home /Users/alice/… must not leak just because CI's $HOME differs).
+_HOME_SHAPE = re.compile(r"/(Users|home)/[^/\s\"']+")
+
+# Standard Claude Code tools are generic (not client identity); anything else — mcp
+# plugins and custom tools/subagents — is hashed for the external cohort.
+GENERIC_TOOLS = frozenset({
+    "Bash", "Edit", "Write", "Read", "MultiEdit", "NotebookEdit", "Glob", "Grep",
+    "Agent", "Task", "TodoWrite", "WebFetch", "WebSearch", "AskUserQuestion",
+    "BashOutput", "KillShell", "KillBash", "SlashCommand", "ExitPlanMode",
+})
+
+
+def scrub_text(s, home, login):
+    if not isinstance(s, str):
+        return s
+    if home:
+        s = s.replace(home, "~")
+    s = _HOME_SHAPE.sub(r"/\1/<user>", s)
+    if login:
+        s = s.replace(login, "<user>")
+    for name, pat in SECRET_PATTERNS:
+        s = pat.sub("<redacted:%s>" % name, s)
+    return s
+
+
+def _hash(salt, value):
+    try:
+        key = bytes.fromhex(salt) if salt else b"khub"
+    except ValueError:
+        key = (salt or "khub").encode("utf-8")
+    return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+
+
+def _scrub_obj(obj, home, login):
+    if isinstance(obj, dict):
+        # Scrub KEYS as well as values — a secret or path can sit in key position
+        # (a tool name, a branch/task/subagent label) and must not pass verbatim.
+        return {(scrub_text(k, home, login) if isinstance(k, str) else k): _scrub_obj(v, home, login)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_obj(v, home, login) for v in obj]
+    return scrub_text(obj, home, login)
+
+
+def _mask_tool(name, salt, cohort):
+    """Hash mcp/plugin tool names (toolchain identity) for every cohort; hash any
+    non-generic tool/subagent name for the external cohort. Generic tools pass through
+    so the tool-usage pattern stays readable."""
+    if not isinstance(name, str):
+        return name
+    if name.startswith("mcp__"):
+        return "mcp:%s" % _hash(salt, name)
+    if cohort == "external" and name not in GENERIC_TOOLS:
+        return "tool:%s" % _hash(salt, name)
+    return name
+
+
+def sanitize_metrics(rec, cohort, salt, home, login):
+    if not isinstance(rec, dict):
+        return None
+    out = {k: rec[k] for k in SAFE_TOP if k in rec}
+    # tool names: hash mcp always, non-generic tools for external (keep the counts)
+    tc = out.get("tool_calls")
+    if isinstance(tc, dict):
+        out["tool_calls"] = {_mask_tool(k, salt, cohort): v for k, v in tc.items()}
+    # external cohort: task/branch labels + subagent-type names can identify — hash them
+    if cohort == "external":
+        if isinstance(out.get("task"), str):
+            out["task"] = "task:%s" % _hash(salt, out["task"])
+        tbt = out.get("tokens_by_task")
+        if isinstance(tbt, dict):
+            out["tokens_by_task"] = {("task:%s" % _hash(salt, k)): v for k, v in tbt.items()}
+        sub = out.get("subagents")
+        if isinstance(sub, dict) and isinstance(sub.get("types"), dict):
+            sub = dict(sub)
+            sub["types"] = {_mask_tool(k, salt, cohort): v for k, v in sub["types"].items()}
+            out["subagents"] = sub
+    # final defence: scrub every string leaf AND key for $HOME/login/secrets
+    return _scrub_obj(out, home, login)
+
+
+def build_bundle(args):
+    cohort = args.cohort or "unset"
+    if cohort == "external":
+        tok = args.dpa_token
+        if not (tok and os.path.isfile(tok) and os.path.getsize(tok) > 0):
+            sys.stderr.write(
+                "external-cohort export is BLOCKED: no DPA consent token.\n"
+                "  a named DPA owner must provision the token file before external export can run.\n"
+            )
+            return EXIT_EXTERNAL_BLOCKED
+
+    os.makedirs(args.out, exist_ok=True)
+    recs = []
+    for path in sorted(glob.glob(os.path.join(args.state, "metrics", "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except Exception:
+            continue
+        san = sanitize_metrics(rec, cohort, args.salt, args.home, args.login)
+        if san is not None:
+            recs.append(san)
+    with open(os.path.join(args.out, "metrics.ndjson"), "w", encoding="utf-8") as fh:
+        for r in recs:
+            fh.write(json.dumps(r, sort_keys=True) + "\n")
+
+    snippet_count = 0
+    if args.with_snippets:
+        with open(os.path.join(args.out, "snippets.redacted.ndjson"), "w", encoding="utf-8") as out:
+            for path in sorted(glob.glob(os.path.join(args.state, "capture", "*.jsonl"))):
+                try:
+                    lines = open(path, encoding="utf-8").read().splitlines()
+                except Exception:
+                    continue
+                for line in lines:   # per-LINE: one bad line never drops the rest
+                    try:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        turn = json.loads(line)
+                        tools = turn.get("tools")
+                        tools = tools if isinstance(tools, list) else []
+                        # _scrub_obj (recursive) — a dict/list value is scrubbed, not
+                        # passed through raw like scrub_text would.
+                        snip = {
+                            "prompt": _scrub_obj(turn.get("prompt", ""), args.home, args.login),
+                            "tools": [_mask_tool(t, args.salt, cohort) for t in tools],
+                        }
+                        # responses can echo client code — dropped entirely for external
+                        if not args.exclude_tool_bodies:
+                            snip["response"] = _scrub_obj(turn.get("response", ""), args.home, args.login)
+                        out.write(json.dumps(snip, sort_keys=True) + "\n")
+                        snippet_count += 1
+                    except Exception:
+                        continue
+
+    manifest = {
+        "schema_version": 1,
+        "session_count": len(recs),
+        "cohort": cohort,
+        "includes_snippets": bool(args.with_snippets),
+        "snippet_count": snippet_count,
+        "consent": {"opt_in": True, "cohort": cohort,
+                    "dpa_token": bool(cohort == "external" and args.dpa_token)},
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, sort_keys=True, indent=2)
+        fh.write("\n")
+    return EXIT_OK
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="export_redact.py")
+    p.add_argument("--state", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--cohort", default="unset")
+    p.add_argument("--dpa-token", dest="dpa_token", default=None)
+    p.add_argument("--salt", default="")
+    p.add_argument("--home", default=None)
+    p.add_argument("--login", default=None)
+    p.add_argument("--with-snippets", dest="with_snippets", action="store_true")
+    p.add_argument("--exclude-tool-bodies", dest="exclude_tool_bodies", action="store_true")
+    args = p.parse_args(argv)
+    return build_bundle(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+KHUB_EMBEDDED_PY_EOF
+}
+# <<< END embedded telemetry helpers <<<
+
 # ---- dispatch ---------------------------------------------------------------
 main() {
   local cmd="${1:-help}"; if [ $# -gt 0 ]; then shift; fi
@@ -298,6 +2361,9 @@ main() {
     update)          cmd_update "$@" ;;
     upgrade|self-update) cmd_upgrade "$@" ;;
     doctor)          cmd_doctor "$@" ;;
+    track)           cmd_track "$@" ;;
+    metrics)         cmd_metrics "$@" ;;
+    export)          cmd_export "$@" ;;
     version|--version|-v) cmd_version "$@" ;;
     help|--help|-h)  usage ;;
     *)               printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;

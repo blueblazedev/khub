@@ -1,0 +1,30 @@
+{
+  "model": "claude-opus-4-8",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node /home/dev/.claude/hooks/session-start.cjs" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "node /home/dev/.claude/hooks/scout-block.cjs" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node /home/dev/.claude/hooks/stop.cjs" }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": ["Bash(git:*)"]
+  }
+}

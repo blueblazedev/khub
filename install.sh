@@ -19,6 +19,16 @@ REPO="blueblazedev/khub"
 BIN_DIR="${KHUB_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${KHUB_INSTALL_VERSION:-}"
 
+# Style: 16-color + glyphs, only on an interactive TTY with NO_COLOR unset. The
+# common `curl | bash` pipe is non-TTY, so output stays plain. Presentation only
+# — the verification logic below is exactly as shipped.
+c_reset=''; c_grn=''; c_ylw=''; c_cyan=''; c_dim=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_reset=$'\033[0m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_cyan=$'\033[36m'; c_dim=$'\033[2m'
+fi
+_loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$_loc" in *UTF-8*|*utf-8*|*UTF8*|*utf8*) g_ok='✓'; g_warn='⚠'; g_arrow='→' ;; *) g_ok='OK'; g_warn='!!'; g_arrow='->' ;; esac
+
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
 
 if [ -z "$VERSION" ]; then
@@ -43,7 +53,7 @@ mkdir -p "$BIN_DIR"
 tmp="$(mktemp "$BIN_DIR/.khub-download.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
-echo "Installing khub ${VERSION} -> ${BIN_DIR}/khub"
+printf '%s>%s Installing khub %s %s %s\n' "$c_cyan" "$c_reset" "$VERSION" "$g_arrow" "$BIN_DIR/khub"
 curl -sfL "$url" -o "$tmp" || { echo "error: download failed: $url" >&2; exit 1; }
 
 # sha256 of a file via whichever tool exists (both preinstalled on macOS/Linux).
@@ -55,8 +65,8 @@ sha256_of() {
 }
 
 if [ "${KHUB_SKIP_VERIFY:-}" = "1" ]; then
-  echo "WARNING: KHUB_SKIP_VERIFY=1 — installing WITHOUT checksum verification." >&2
-  echo "         Use this only to install a legacy release that predates SHA256SUMS." >&2
+  printf '%s%s%s WARNING: KHUB_SKIP_VERIFY=1 — installing WITHOUT checksum verification.\n' "$c_ylw" "$g_warn" "$c_reset" >&2
+  printf '   Use this only to install a legacy release that predates SHA256SUMS.\n' >&2
   actual="$(sha256_of "$tmp" || true)"
 else
   actual="$(sha256_of "$tmp")" || { echo "error: no sha256 tool (shasum/sha256sum) available — cannot verify" >&2; exit 1; }
@@ -90,11 +100,11 @@ case ":$PATH:" in
 esac
 
 if [ "${KHUB_SKIP_VERIFY:-}" = "1" ]; then
-  echo "Done (unverified). sha256: ${actual:-unknown}"
+  printf '%s%s%s installed (unverified). sha256: %s\n' "$c_ylw" "$g_warn" "$c_reset" "${actual:-unknown}"
 else
-  echo "Done. verified sha256: ${actual}"
+  printf '%s%s%s verified sha256: %s\n' "$c_grn" "$g_ok" "$c_reset" "$actual"
 fi
-echo "  khub version   # confirm it runs"
+printf '  %skhub version   # confirm it runs%s\n' "$c_dim" "$c_reset"
 echo ""
-echo "Optional — verify build provenance after 'gh auth login':"
-echo "  gh attestation verify \"$BIN_DIR/khub\" --repo ${REPO} --signer-workflow ${REPO}/.github/workflows/release.yml"
+printf '%sOptional — verify build provenance after '\''gh auth login'\'':%s\n' "$c_dim" "$c_reset"
+printf '  %sgh attestation verify "%s/khub" --repo %s --signer-workflow %s/.github/workflows/release.yml%s\n' "$c_dim" "$BIN_DIR" "$REPO" "$REPO" "$c_reset"

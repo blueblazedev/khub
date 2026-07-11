@@ -88,6 +88,66 @@ Point a code repo at the hub (writes a one-line pointer `CLAUDE.md`):
 | `khub update` | Fast-forward the clone to the latest published snapshot. `--path DIR` to point at it; `--reset` to discard local changes (confirms first). |
 | `khub doctor` | Diagnose auth, repo access, git-clone access, sibling layout, tampering, and snapshot freshness — each with a fix hint. |
 | `khub version` | Print the CLI version and the clone's latest snapshot (SHA + date). |
+| `khub track <enable\|disable\|status\|repair\|task\|debug\|doctor\|purge>` | Opt-in, **local-only** session telemetry (OFF by default). `task <id>` books tokens to a ticket; `purge` deletes everything. See below. |
+| `khub metrics [--by-task]` | Show the latest session's local report, or total output tokens per ticket across sessions. |
+| `khub export [--with-snippets]` | Write a **redacted, review-before-send** bundle of the metrics (metrics-only + grep-proof by default). Never uploads. |
+
+## Session telemetry (opt-in)
+
+`khub track` is an **opt-in, local-first** way to measure your own ways of working
+across Claude Code sessions. It is **OFF until you run `khub track enable`**, and
+nothing ever leaves your machine.
+
+- `khub track enable` — after printing exactly what it does, it backs up your
+  `~/.claude/settings.json`, then **non-destructively** registers a small python3
+  hook under `SessionStart` + `SessionEnd`. Only khub's own entries are added
+  (identified by a marker, never by position), so any existing hooks are left
+  byte-for-byte intact. Requires `python3`; if it is missing, enable changes
+  nothing and tells you. Use `--project` to install into the current repo's
+  `.claude/settings.json` instead of user scope.
+- `khub track disable` — removes **only** khub's entries and the hook file; your
+  settings backups are kept.
+- `khub track status` — shows whether telemetry is enabled, whether the hook is
+  registered, and whether the hook file still matches what was installed.
+- `khub track repair` — reinstalls the hook and re-asserts registration if either
+  drifted.
+
+When a session ends, the hook reads that session's transcript and writes **process
+metrics** — prompt/turn counts, tool usage, token totals, edits, error→retry loops,
+subagents, session duration — to your local state dir. Run **`khub metrics`** to see
+the latest session's report. The metrics file holds **counts only, no raw prompt or
+response text**; a separate raw capture (also local) is kept briefly for a future
+opt-in, redacted export. Automation sessions (any `sdk-*` surface) and synthetic
+(non-LLM) turns are ignored — only interactive work is measured.
+
+**Tokens per ticket.** To measure how many tokens a task/ticket cost, tag your work:
+`khub track task <ticket-id>` books every following session's tokens to that ticket
+(clear with `khub track task --clear`). With no tag set, tokens attribute to the git
+branch each turn ran on. `khub metrics --by-task` then totals **output tokens per
+ticket** across however many sessions the ticket took.
+
+**Setup fingerprint.** Each session is also tagged with the *setup* it ran under —
+harness (ClaudeKit vs vanilla), model, OS, skill/rule presence, a git-branch/repo id,
+and an optional cohort (`khub track enable --cohort internal|external`) — so you can
+compare ways of working. Identifying fields (repo id, skill names) are stored only as
+**salted hashes** using a random per-install key that never leaves your machine.
+
+**Troubleshooting.** The hook is fail-open (it never blocks a session), so it's silent
+on errors. If capture isn't happening, turn on the opt-in debug log with `khub track
+debug on`, reproduce a session, then run **`khub track doctor`** — a **redacted,
+paste-ready** report (config, hook registration, integrity, store counts, and the last
+debug lines; `$HOME`→`~`, no prompts/paths/skill names). Safe to share for support or
+for an agent to self-diagnose. `khub track debug off` stops it.
+
+**Sharing + privacy.** `khub export` writes a redacted, **metrics-only** bundle you
+review before sending — nothing is uploaded; `--with-snippets` adds secret-scrubbed
+prompt/response text. External-cohort export is **hard-blocked in code** without a
+data-owner DPA token. `khub track purge` deletes all local data + config + settings
+backups. Full details — exactly what's collected, what can leave, how to disable and
+purge — are in **[docs/telemetry-privacy.md](docs/telemetry-privacy.md)**.
+
+A later release adds `khub export` (metrics-only by default) and `khub track purge`,
+plus a full privacy doc.
 
 ## Pull-only policy
 
