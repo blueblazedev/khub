@@ -2,7 +2,7 @@
 # Tests for lib/telemetry/capture_hook.py — the SessionEnd rollup that turns a real
 # Claude Code transcript into process metrics. Asserts every metric against a
 # hand-counted fixture, determinism, fail-open behaviour, the population filter
-# (drop sdk-ts/automation), the session-id join (F7), and that metrics carry NO raw
+# (drop sdk-ts/automation), the session-id join, and that metrics carry NO raw
 # prompt/response text.
 #
 # NOTE: -e is intentionally OFF — several cases assert on non-zero-free fail-open.
@@ -128,7 +128,7 @@ b=0; [ "$rc2" -eq 0 ] && [ ! -f "$(metrics_json "$sb2" S5)" ] && b=1
 if [ "$a" -eq 1 ] && [ "$b" -eq 1 ]; then _ok "fail-open: absent transcript + gated-off => exit 0, no files"; else _no "fail-open: absent/gated mishandled (rc=$rc/$rc2)"; fi
 rm -rf "$sb" "$sb2"
 
-# 7. SessionStart event is a no-op in this phase (fingerprint is a later phase), exit 0
+# 7. SessionStart writes a fingerprint, never a metrics rollup — no metrics file, exit 0
 sb="$(sandbox)"; enable_cfg "$sb"
 fire "$sb" SessionStart S6 "$FIX/session-cli.transcript.jsonl"; rc=$?
 if [ "$rc" -eq 0 ] && [ ! -f "$(metrics_json "$sb" S6)" ]; then _ok "SessionStart: no rollup this phase, exit 0"; else _no "SessionStart mishandled (rc=$rc)"; fi

@@ -6,10 +6,10 @@ parses JSON itself. This is the highest-consequence surface in the telemetry
 feature — a bad merge corrupts the engineer's Claude Code config — so every write
 is:
 
-  * NON-DESTRUCTIVE   only khub's own entries (marked ``_khub``) are added/removed;
-                      co-existing hooks from ClaudeKit or anything else are never
-                      touched, and entries are matched by an explicit marker key,
-                      never by list position or a command substring (spoofable).
+  * NON-DESTRUCTIVE   only khub's own entries are added/removed; co-existing hooks
+                      from ClaudeKit or anything else are never touched. khub's
+                      entries are recognised by the stable hook-path token in their
+                      command (see HOOK_TOKEN below), never by list position.
   * IDEMPOTENT        N enables leave exactly one khub block per event.
   * ATOMIC + MODE-SAFE  write to a temp file in the same dir, preserve the
                       original's permission bits (no 0600->0644 widening), fsync,
@@ -23,7 +23,7 @@ is:
 
 Subcommands (the khub CLI is the only caller):
 
-  enable  <settings_path> --version N --command CMD
+  enable  <settings_path> --command CMD
   disable <settings_path>
   status  <settings_path> [--command CMD]      # prints start=/end=/drift= lines
 
@@ -96,7 +96,7 @@ def is_khub_entry(entry):
 def make_entry(command):
     # Schema-clean: exactly the {matcher?, hooks} the hookMatcher object permits — no
     # extra keys. No matcher => broadest firing intent (whether a matcher-less
-    # SessionStart fires for every source is a live-session question for Phase 2).
+    # SessionStart fires for every source was verified on a live session).
     # Identity is carried by the command path (HOOK_TOKEN), not a marker key.
     return {"hooks": [{"type": "command", "command": command}]}
 

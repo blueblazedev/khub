@@ -33,7 +33,8 @@ def build_block():
         "# Source of truth: lib/telemetry/*.py",
     ]
     for fname, func in HELPERS:
-        src = open(os.path.join(ROOT, "lib", "telemetry", fname), encoding="utf-8").read()
+        with open(os.path.join(ROOT, "lib", "telemetry", fname), encoding="utf-8") as fh:
+            src = fh.read()
         if DELIM in src:
             sys.exit("error: heredoc delimiter %r appears in %s" % (DELIM, fname))
         out.append("%s() {" % func)
@@ -46,7 +47,8 @@ def build_block():
 
 
 def main():
-    text = open(KHUB, encoding="utf-8").read()
+    with open(KHUB, encoding="utf-8") as fh:
+        text = fh.read()
     try:
         start = text.index(BEGIN)
         end = text.index(END) + len(END)

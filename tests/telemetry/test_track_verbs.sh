@@ -206,6 +206,12 @@ else _no "track task: attribution flow broke (set=$set_ok tagged=$tagged)" "$by"
 run_track "$sb" task --clear >/dev/null 2>&1
 if [ ! -f "$tf" ]; then _ok "track task --clear: removes the active ticket"
 else _no "track task --clear: task file remained"; fi
+# the active ticket SURVIVES disable (reversible off-switch); only purge clears it
+run_track "$sb" task "KHUB-KEEP" >/dev/null 2>&1
+run_track "$sb" disable >/dev/null 2>&1
+if [ -s "$tf" ] && [ "$(head -1 "$tf")" = "KHUB-KEEP" ]; then
+  _ok "task contract: active ticket survives disable (only purge clears it)"
+else _no "task contract: disable deleted the active ticket"; fi
 rm -rf "$sb"
 
 # 10. self-contained: with NO on-disk lib/ (empty KHUB_LIB_DIR) the EMBEDDED helpers

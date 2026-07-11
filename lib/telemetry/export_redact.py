@@ -60,8 +60,8 @@ SECRET_PATTERNS = [
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("secret-assign", re.compile(r"\b[A-Z][A-Z0-9_]{2,}=[^\s\"']{8,}")),
 ]
-# Collapse a home-directory path shape even when it is not the runtime $HOME (F8:
-# a client home /Users/alice/… must not leak just because CI's $HOME differs).
+# Collapse a home-directory path shape even when it is not the runtime $HOME —
+# a client home /Users/alice/… must not leak just because CI's $HOME differs.
 _HOME_SHAPE = re.compile(r"/(Users|home)/[^/\s\"']+")
 
 # Standard Claude Code tools are generic (not client identity); anything else — mcp
@@ -87,11 +87,21 @@ def scrub_text(s, home, login):
 
 
 def _hash(salt, value):
+    """THE salted-hash contract — keep byte-identical with capture_hook._salted():
+    HMAC-SHA256, truncated to 16 hex chars, and NO SALT MEANS NO HASH (a constant-key
+    hash of a guessable input would be pseudo-anonymisation, not anonymisation).
+    Kept as two copies on purpose: a shared module would cost a fifth embedded file
+    in the single-file distribution. Callers degrade a None to an 'unknown' bucket."""
+    if not salt or value is None or value == "":
+        return None
     try:
-        key = bytes.fromhex(salt) if salt else b"khub"
-    except ValueError:
-        key = (salt or "khub").encode("utf-8")
-    return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+        key = bytes.fromhex(salt)
+    except (ValueError, TypeError):
+        key = salt.encode("utf-8")
+    try:
+        return hmac.new(key, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    except Exception:
+        return None
 
 
 def _scrub_obj(obj, home, login):
@@ -108,13 +118,14 @@ def _scrub_obj(obj, home, login):
 def _mask_tool(name, salt, cohort):
     """Hash mcp/plugin tool names (toolchain identity) for every cohort; hash any
     non-generic tool/subagent name for the external cohort. Generic tools pass through
-    so the tool-usage pattern stays readable."""
+    so the tool-usage pattern stays readable. Saltless degrades to a fixed 'unknown'
+    bucket — identity never leaves un-salted, counts survive."""
     if not isinstance(name, str):
         return name
     if name.startswith("mcp__"):
-        return "mcp:%s" % _hash(salt, name)
+        return "mcp:%s" % (_hash(salt, name) or "unknown")
     if cohort == "external" and name not in GENERIC_TOOLS:
-        return "tool:%s" % _hash(salt, name)
+        return "tool:%s" % (_hash(salt, name) or "unknown")
     return name
 
 
@@ -129,10 +140,23 @@ def sanitize_metrics(rec, cohort, salt, home, login):
     # external cohort: task/branch labels + subagent-type names can identify — hash them
     if cohort == "external":
         if isinstance(out.get("task"), str):
-            out["task"] = "task:%s" % _hash(salt, out["task"])
+            out["task"] = "task:%s" % (_hash(salt, out["task"]) or "unknown")
         tbt = out.get("tokens_by_task")
         if isinstance(tbt, dict):
-            out["tokens_by_task"] = {("task:%s" % _hash(salt, k)): v for k, v in tbt.items()}
+            # saltless keys all become task:unknown — MERGE their token counts
+            # instead of letting a dict comprehension keep only the last one.
+            merged = {}
+            for k, v in tbt.items():
+                nk = "task:%s" % (_hash(salt, k) or "unknown")
+                if nk in merged and isinstance(merged[nk], dict) and isinstance(v, dict):
+                    for tk, tv in v.items():
+                        try:
+                            merged[nk][tk] = merged[nk].get(tk, 0) + int(tv)
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    merged[nk] = dict(v) if isinstance(v, dict) else v
+            out["tokens_by_task"] = merged
         sub = out.get("subagents")
         if isinstance(sub, dict) and isinstance(sub.get("types"), dict):
             sub = dict(sub)
@@ -173,7 +197,8 @@ def build_bundle(args):
         with open(os.path.join(args.out, "snippets.redacted.ndjson"), "w", encoding="utf-8") as out:
             for path in sorted(glob.glob(os.path.join(args.state, "capture", "*.jsonl"))):
                 try:
-                    lines = open(path, encoding="utf-8").read().splitlines()
+                    with open(path, encoding="utf-8") as fh:
+                        lines = fh.read().splitlines()
                 except Exception:
                     continue
                 for line in lines:   # per-LINE: one bad line never drops the rest

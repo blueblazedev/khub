@@ -7,8 +7,8 @@ send yourself, if you choose to.
 
 ## What it records (per session)
 
-When a Claude Code session ends, a hook reads that session's transcript and writes
-three things under `${XDG_STATE_HOME:-~/.local/state}/khub-telemetry/`:
+A hook observes each session (fingerprint at start; the rest at end) and writes
+these records under `${XDG_STATE_HOME:-~/.local/state}/khub-telemetry/`:
 
 | File | Contents | Leaves your machine? |
 | ---- | -------- | -------------------- |

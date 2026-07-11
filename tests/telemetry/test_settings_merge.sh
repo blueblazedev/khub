@@ -7,7 +7,6 @@
 # (schema-clean — the settings schema forbids extra keys in a hook-matcher object),
 # so the tests assert on that, not on any marker key.
 #
-# Tests-first origin: authored red before the helper existed, then greened.
 # NOTE: -e is intentionally OFF — several cases assert on non-zero exits.
 set -uo pipefail
 
