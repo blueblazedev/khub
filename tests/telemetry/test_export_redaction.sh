@@ -42,11 +42,23 @@ JSON
   "$PY" - "$sd/capture/s1.jsonl" "$HOME" <<'PY'
 import json, sys
 path, home = sys.argv[1], sys.argv[2]
+# Assemble the FAKE secrets at runtime from split parts so no complete secret literal
+# is committed (GitHub push-protection would block it) — the redactor still sees the
+# full string. These are synthetic test data, not real credentials.
+J = lambda *p: "".join(p)
+ghp   = J("gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWX")
+slack = J("xox", "b-", "1111111111-222222222222-abcdefghijklmnop")
+skp   = J("sk-", "proj-", "ABCDEFGHIJKLMNOPQRSTUVWX")
+gpat  = J("github", "_pat_", "ABCDEFGHIJKLMNOPQRST1234")
+goog  = J("AI", "za", "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+pem   = J("-----BEGIN ", "RSA PRIVATE KEY-----\n", "MIIEpemBODYSECRET1234567890\n", "-----END ", "RSA PRIVATE KEY-----")
 turn = {
   "ts": "2026-07-11T00:00:00Z",
-  "prompt": "deploy with ghp_ABCDEFGHIJKLMNOPQRSTUVWX and email bob@acme.com",
-  "response": "wrote " + home + "/secret.py and /Users/alice/clientwork/app.py; key sk-ABCDEFGHIJKLMNOPQRSTUV; url https://user:pass@git.acme.com/repo",
-  "tools": ["Bash", "Edit"],
+  "prompt": "deploy %s, email bob@acme.com, slack %s" % (ghp, slack),
+  "response": ("wrote " + home + "/secret.py and /Users/alice/clientwork/app.py; "
+               "openai %s; github %s; google %s; url https://user:pass@git.acme.com/r; %s"
+               % (skp, gpat, goog, pem)),
+  "tools": ["Bash", "mcp__acme_secret_server"],
 }
 open(path, "w").write(json.dumps(turn) + "\n")
 PY
@@ -75,12 +87,13 @@ run --state "$sd" --out "$out" --cohort internal --salt "$SALT" --home "$HOME" -
 snip="$out/snippets.redacted.ndjson"
 if [ -f "$snip" ]; then
   leak=0
-  for n in "ghp_ABCDEFG" "bob@acme.com" "sk-ABCDEFG" "$HOME" "/Users/alice" "user:pass@"; do
+  for n in "ghp_ABCDEFG" "bob@acme.com" "sk-proj-ABC" "github_pat_ABC" "xoxb-1111" "AIzaABC" \
+           "$HOME" "/Users/alice" "user:pass@" "MIIEpemBODYSECRET" "mcp__acme_secret_server"; do
     grep -qF "$n" "$snip" && { leak=1; echo "       leaked in snippets: $n"; }
   done
   # and the redaction markers are present (proves scrub ran, not just dropped text)
   grep -q '<redacted:gh-token>' "$snip" && grep -q '<redacted:email>' "$snip" || leak=1
-  if [ "$leak" -eq 0 ]; then _ok "snippets: gh-token/email/openai-key/HOME/client-home/url-creds all redacted"
+  if [ "$leak" -eq 0 ]; then _ok "snippets: gh/openai(sk-proj)/github-pat/slack/google/PEM-body/url/HOME/mcp-name all redacted"
   else _no "snippets: a planted secret survived"; fi
 else _no "snippets: file not produced"; fi
 rm -rf "$sd"
@@ -108,6 +121,31 @@ run --state "$sd" --out "$out" --cohort internal --salt "$SALT" --home "$HOME" >
 if "$PY" -c 'import json,sys;m=json.load(open(sys.argv[1]));sys.exit(0 if m["session_count"]==1 and m["cohort"]=="internal" and m["consent"]["opt_in"] else 1)' "$out/manifest.json"; then
   _ok "manifest: records session count + cohort + consent"
 else _no "manifest: wrong contents"; fi
+rm -rf "$sd"
+
+# 6. KEY-POSITION leaks: a secret/path in a dict KEY (tool name), or client identity
+#    in a subagent-type name, must not pass through verbatim.
+sd="$(mktemp -d "${TMPDIR:-/tmp}/khub-exp.XXXXXX")"; mkdir -p "$sd/metrics"; tok="$sd/tok"; printf 'x\n' > "$tok"
+cat > "$sd/metrics/k1.json" <<JSON
+{"schema_version":1,"session_id":"k1","prompts":1,"turns":1,"tool_calls_total":1,
+ "tool_calls":{"wt_/Users/alice/clientwork":1,"Bash":2},
+ "subagents":{"total":1,"types":{"acme-billing-migration":1}},
+ "tokens":{"input":1,"output":1,"cache_read":0,"cache_creation":0},
+ "task":"feat/x","tokens_by_task":{"feat/x":{"output":1,"input":1}},
+ "setup":{"harness":"vanilla"}}
+JSON
+kk=1
+# internal: a PATH in a key is scrubbed (Bash stays readable)
+run --state "$sd" --out "$sd/ei" --cohort internal --salt "$SALT" --home "$HOME" >/dev/null 2>&1
+grep -qF "/Users/alice" "$sd/ei/metrics.ndjson" && { kk=0; echo "       internal leaked /Users/alice in a tool-name key"; }
+grep -q '"Bash"' "$sd/ei/metrics.ndjson" || { kk=0; echo "       internal dropped the generic Bash key"; }
+# external: client identity in subagent/tool names is hashed; path still scrubbed
+run --state "$sd" --out "$sd/ee" --cohort external --dpa-token "$tok" --salt "$SALT" --home "$HOME" >/dev/null 2>&1
+for n in "acme-billing-migration" "/Users/alice"; do
+  grep -qF "$n" "$sd/ee/metrics.ndjson" && { kk=0; echo "       external leaked in a key: $n"; }
+done
+if [ "$kk" -eq 1 ]; then _ok "keys: path-in-key scrubbed (both cohorts); external hashes subagent/tool identity"
+else _no "keys: a key-position leak survived"; fi
 rm -rf "$sd"
 
 # ---------------------------------------------------------------------------

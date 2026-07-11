@@ -40,7 +40,10 @@ export is hard-blocked in code**: `khub export` refuses to run unless a named da
 owner has provisioned a DPA consent token at
 `${XDG_CONFIG_HOME:-~/.config}/khub/telemetry-dpa-token`. This is deliberate — sharing
 telemetry from a client machine contradicts khub's pull-only trust model and needs an
-owner's written sign-off. For external, response bodies are also excluded from snippets.
+owner's written sign-off. The token's **presence** is the machine gate (a forcing
+function that a human provisioned it — not a cryptographic consent check); for external,
+tool/subagent/branch names are hashed and response bodies are excluded from snippets.
+`khub track purge` also deletes this token.
 
 ## Inspect, disable, purge
 
