@@ -32,6 +32,30 @@ jobs:
           /bin/bash -n install.sh
           for t in tests/telemetry/*.sh scripts/check-embedded-telemetry.sh; do /bin/bash -n "$t"; done
 
+  # >>> BEGIN branding job (stripped from branded trees by brand-compile) >>>
+  branding:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10   # v6.0.3
+      - name: brand compiler + branded-tree verification (fictional fixture brand)
+        run: |
+          set -euo pipefail
+          if command -v shellcheck >/dev/null; then
+            shellcheck scripts/brand-verify.sh tests/branding/*.sh
+          fi
+          /bin/bash -n scripts/brand-verify.sh
+          for t in tests/branding/*.sh; do /bin/bash -n "$t"; done
+          python3 -m py_compile scripts/brand-compile.py
+          # compiler gates: census self-check, zero-grep, determinism, manifest…
+          bash tests/branding/test_brand_compile.sh
+          # verifier gates: harness-can-fail, suites-in-tree, smoke, fail-closed channel
+          bash tests/branding/test_brand_verify.sh
+  # <<< END branding job <<<
+
   telemetry:
     strategy:
       fail-fast: false

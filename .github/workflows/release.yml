@@ -1,10 +1,17 @@
 name: release
 
 # A `v*` tag push cuts a release: three assets (khub, install.sh, SHA256SUMS)
-# plus a build-provenance attestation on each executable asset. Two authorization
-# gates guard the signing key: only the owner can create `v*` tags (repo ruleset),
-# and this workflow additionally refuses any tag whose commit is not an ancestor
-# of `main` — an unreviewed commit must never become a signed release.
+# plus — when attestation is enabled — a build-provenance attestation on each
+# executable asset. Two authorization gates guard the release: only the owner
+# can create `v*` tags (repo ruleset), and this workflow additionally refuses
+# any tag whose commit is not an ancestor of the release branch — an unreviewed
+# commit must never become a published release.
+#
+# RELEASE_BRANCH / ATTEST_PROVENANCE are build defaults: a tree compiled for a
+# client org substitutes the client's default branch, and disables attestation
+# unless the org is GitHub Enterprise Cloud (attestations on private repos are
+# a GHEC feature; without it, trust = private repo in the client's own tenancy
+# plus SHA256SUMS).
 
 on:
   push:
@@ -15,23 +22,27 @@ permissions:
   id-token: write        # OIDC token for the attestation
   attestations: write    # write the build-provenance attestation
 
+env:
+  RELEASE_BRANCH: "main"
+  ATTEST_PROVENANCE: "true"
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10   # v6.0.3
         with:
-          fetch-depth: 0   # full history so the ancestor-of-main check can resolve
+          fetch-depth: 0   # full history so the ancestor check can resolve
 
-      - name: Refuse a tag whose commit is not on main
+      - name: Refuse a tag whose commit is not on the release branch
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of main — refusing to sign an unreviewed commit"
+          git fetch --no-tags origin "+refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${RELEASE_BRANCH}"; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of ${RELEASE_BRANCH} — refusing to release an unreviewed commit"
             exit 1
           fi
-          echo "ok: ${GITHUB_SHA} is on main"
+          echo "ok: ${GITHUB_SHA} is on ${RELEASE_BRANCH}"
 
       - name: Re-run CI gates
         run: |
@@ -54,19 +65,23 @@ jobs:
             printf 'or partial download; not a compromised release):\n\n'
             printf '```\n'
             cat SHA256SUMS
-            printf '```\n\n'
-            printf 'Build provenance is attested to this release workflow. After `gh auth login`:\n\n'
             printf '```\n'
-            printf 'gh attestation verify khub --repo %s --signer-workflow %s/.github/workflows/release.yml\n' "$GITHUB_REPOSITORY" "$GITHUB_REPOSITORY"
-            printf '```\n'
+            if [ "$ATTEST_PROVENANCE" = "true" ]; then
+              printf '\nBuild provenance is attested to this release workflow. After `gh auth login`:\n\n'
+              printf '```\n'
+              printf 'gh attestation verify khub --repo %s --signer-workflow %s/.github/workflows/release.yml\n' "$GITHUB_REPOSITORY" "$GITHUB_REPOSITORY"
+              printf '```\n'
+            fi
           } > notes.md
           gh release create "$GITHUB_REF_NAME" khub install.sh SHA256SUMS \
             --title "khub $GITHUB_REF_NAME" \
             --notes-file notes.md
 
       # Attest AFTER the release exists: a failed release run must not leave
-      # attestations minted for bytes that never shipped.
+      # attestations minted for bytes that never shipped. Skipped when the
+      # hosting org cannot store attestations (non-GHEC private repos).
       - name: Attest build provenance
+        if: ${{ env.ATTEST_PROVENANCE == 'true' }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373   # v4.1.1
         with:
           subject-path: |

@@ -160,26 +160,42 @@ def source_head_rev(source):
 
 # ---- rule table ------------------------------------------------------------------
 def line_subs(conf):
-    """Anchored value substitutions on the CLI file. Each must hit EXACTLY once —
-    zero means the census anchor vanished (engine drift), more means a duplicate."""
+    """Anchored value substitutions, scoped per file. Each must hit EXACTLY once
+    in its file — zero means the census anchor vanished (engine drift), more
+    means a duplicate. Returns {rel_path: [(regex, replacement, name), ...]}."""
     cli_name = conf["cli_repo"].split("/", 1)[1]
     content_name = conf["content_repo"].split("/", 1)[1]
-    return [
-        (re.compile(r'^ORG="blueblazedev"', re.M),
-         'ORG="%s"' % conf["org"], "ORG"),
-        (re.compile(r'^KHUB_REPO="\$\{ORG\}/khub"', re.M),
-         'KHUB_REPO="${ORG}/%s"' % cli_name, "KHUB_REPO"),
-        (re.compile(r'^CLIENT_REPO="\$\{KHUB_CLIENT_REPO:-\$\{ORG\}/knowledge-hub-client\}"', re.M),
-         'CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/%s}"' % content_name, "CLIENT_REPO"),
-        (re.compile(r'^HUB_DIRNAME="knowledge-hub"', re.M),
-         'HUB_DIRNAME="%s"' % conf["hub_dirname"], "HUB_DIRNAME"),
-        (re.compile(r'^BOT_SUBJECT_PREFIX="publish: snapshot"', re.M),
-         'BOT_SUBJECT_PREFIX="%s"' % conf["bot_subject_prefix"], "BOT_SUBJECT_PREFIX"),
-        (re.compile(r'^BOT_AUTHOR="knowledge-hub-bot"', re.M),
-         'BOT_AUTHOR="%s"' % conf["bot_author"], "BOT_AUTHOR"),
-        (re.compile(r'^TRACK_DEFAULT_COHORT=""', re.M),
-         'TRACK_DEFAULT_COHORT="external"', "TRACK_DEFAULT_COHORT"),
-    ]
+    attest = "true" if conf["ghec"] == "true" else "false"
+    return {
+        "khub": [
+            (re.compile(r'^ORG="blueblazedev"', re.M),
+             'ORG="%s"' % conf["org"], "ORG"),
+            (re.compile(r'^KHUB_REPO="\$\{ORG\}/khub"', re.M),
+             'KHUB_REPO="${ORG}/%s"' % cli_name, "KHUB_REPO"),
+            (re.compile(r'^CLIENT_REPO="\$\{KHUB_CLIENT_REPO:-\$\{ORG\}/knowledge-hub-client\}"', re.M),
+             'CLIENT_REPO="${KHUB_CLIENT_REPO:-${ORG}/%s}"' % content_name, "CLIENT_REPO"),
+            (re.compile(r'^HUB_DIRNAME="knowledge-hub"', re.M),
+             'HUB_DIRNAME="%s"' % conf["hub_dirname"], "HUB_DIRNAME"),
+            (re.compile(r'^BOT_SUBJECT_PREFIX="publish: snapshot"', re.M),
+             'BOT_SUBJECT_PREFIX="%s"' % conf["bot_subject_prefix"], "BOT_SUBJECT_PREFIX"),
+            (re.compile(r'^BOT_AUTHOR="knowledge-hub-bot"', re.M),
+             'BOT_AUTHOR="%s"' % conf["bot_author"], "BOT_AUTHOR"),
+            (re.compile(r'^TRACK_DEFAULT_COHORT=""', re.M),
+             'TRACK_DEFAULT_COHORT="external"', "TRACK_DEFAULT_COHORT"),
+            (re.compile(r'^RELEASE_CHANNEL="anonymous"', re.M),
+             'RELEASE_CHANNEL="gh"', "RELEASE_CHANNEL(cli)"),
+        ],
+        "install.sh": [
+            (re.compile(r'^RELEASE_CHANNEL="anonymous"', re.M),
+             'RELEASE_CHANNEL="gh"', "RELEASE_CHANNEL(installer)"),
+        ],
+        ".github/workflows/release.yml": [
+            (re.compile(r'^  RELEASE_BRANCH: "main"', re.M),
+             '  RELEASE_BRANCH: "%s"' % conf["default_branch"], "RELEASE_BRANCH"),
+            (re.compile(r'^  ATTEST_PROVENANCE: "true"', re.M),
+             '  ATTEST_PROVENANCE: "%s"' % attest, "ATTEST_PROVENANCE"),
+        ],
+    }
 
 
 def text_rules(conf):
@@ -329,13 +345,12 @@ def main():
             else:
                 if rel == ".github/workflows/ci.yml":
                     text, _ = strip_ci_branding_job(text)
-                if rel == "khub":
-                    for pat, repl, name in subs:
-                        text, n = pat.subn(lambda _m, r=repl: r, text)
-                        if n != 1:
-                            die("census drift: anchor %s matched %d times in the "
-                                "CLI (expected exactly 1) — re-run the census and "
-                                "update the map" % (name, n))
+                for pat, repl, name in subs.get(rel, ()):
+                    text, n = pat.subn(lambda _m, r=repl: r, text)
+                    if n != 1:
+                        die("census drift: anchor %s matched %d times in %s "
+                            "(expected exactly 1) — re-run the census and "
+                            "update the map" % (name, n, rel))
                 for pat, repl, _minc in rules:
                     hits = text.count(pat)
                     if hits:
