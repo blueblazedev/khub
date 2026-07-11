@@ -597,7 +597,7 @@ tel_ensure_salt() {
   [ -s "$sf" ] && return 0
   mkdir -p "$(dirname "$sf")" 2>/dev/null || return 0
   py="$(tel_python3)"
-  [ -n "$py" ] && "$py" -c 'import secrets;print(secrets.token_hex(16))' > "$sf" 2>/dev/null || true
+  if [ -n "$py" ]; then "$py" -c 'import secrets;print(secrets.token_hex(16))' > "$sf" 2>/dev/null || true; fi
   chmod 600 "$sf" 2>/dev/null || true
 }
 tel_hook_dir()    { printf '%s/khub-telemetry' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
@@ -734,7 +734,7 @@ track_enable() {
   tel_write_config 1 "$sha" "$py" "$scope" "$settings"
   tel_ensure_salt   # stable per-install salt for fingerprint identity hashing
   if [ -n "$cohort" ]; then
-    printf '%s\n' "$cohort" > "$(tel_cohort_file)" 2>/dev/null && chmod 600 "$(tel_cohort_file)" 2>/dev/null || true
+    if printf '%s\n' "$cohort" > "$(tel_cohort_file)" 2>/dev/null; then chmod 600 "$(tel_cohort_file)" 2>/dev/null || true; fi
   fi
 
   ok "telemetry enabled (${scope} scope${cohort:+, cohort: $cohort})"
