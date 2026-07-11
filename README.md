@@ -116,7 +116,8 @@ metrics** — prompt/turn counts, tool usage, token totals, edits, error→retry
 subagents, session duration — to your local state dir. Run **`khub metrics`** to see
 the latest session's report. The metrics file holds **counts only, no raw prompt or
 response text**; a separate raw capture (also local) is kept briefly for a future
-opt-in, redacted export. Automation sessions (`sdk-ts`) are ignored.
+opt-in, redacted export. Automation sessions (any `sdk-*` surface) and synthetic
+(non-LLM) turns are ignored — only interactive work is measured.
 
 **Tokens per ticket.** To measure how many tokens a task/ticket cost, tag your work:
 `khub track task <ticket-id>` books every following session's tokens to that ticket

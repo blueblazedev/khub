@@ -91,6 +91,24 @@ if [ "$rc" -eq 0 ] && [ ! -f "$(metrics_json "$sb" S2)" ]; then _ok "population 
 else _no "population filter: sdk-ts not dropped (rc=$rc)"; fi
 rm -rf "$sb"
 
+# 4b. any sdk-* surface is dropped (sdk-cli seen live), and a <synthetic>-model
+#     session is dropped even under an interactive entrypoint
+sb="$(sandbox)"; enable_cfg "$sb"; sdkcli="$sb/sdkcli.jsonl"; syn="$sb/syn.jsonl"
+{
+  printf '%s\n' '{"type":"user","timestamp":"2026-07-11T00:00:00Z","entrypoint":"sdk-cli","message":{"role":"user","content":"x"}}'
+  printf '%s\n' '{"type":"assistant","timestamp":"2026-07-11T00:00:01Z","entrypoint":"sdk-cli","message":{"role":"assistant","content":[{"type":"text","text":"r"}],"usage":{"input_tokens":1,"output_tokens":1}}}'
+} > "$sdkcli"
+{
+  printf '%s\n' '{"type":"user","timestamp":"2026-07-11T00:00:00Z","entrypoint":"cli","message":{"role":"user","content":"x"}}'
+  printf '%s\n' '{"type":"assistant","timestamp":"2026-07-11T00:00:01Z","entrypoint":"cli","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"r"}],"usage":{"input_tokens":1,"output_tokens":1}}}'
+} > "$syn"
+fire "$sb" SessionEnd SC1 "$sdkcli" >/dev/null 2>&1
+fire "$sb" SessionEnd SY1 "$syn" >/dev/null 2>&1
+if [ ! -f "$(metrics_json "$sb" SC1)" ] && [ ! -f "$(metrics_json "$sb" SY1)" ]; then
+  _ok "population filter: sdk-cli + <synthetic>-model sessions dropped"
+else _no "population filter: sdk-cli or synthetic not dropped"; fi
+rm -rf "$sb"
+
 # 5. fail-open: malformed lines are skipped, a record is still emitted, exit 0
 sb="$(sandbox)"; enable_cfg "$sb"
 fire "$sb" SessionEnd S3 "$FIX/session-malformed.transcript.jsonl"; rc=$?

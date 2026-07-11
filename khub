@@ -1414,7 +1414,12 @@ SUBAGENT_TOOLS = ("Agent", "Task")
 REWORK_MIN = 3            # a file edited >= this many times = a rework/churn signal
 SHORT_PROMPT_MAX = 40     # a short, non-first prompt ~ a correction/clarification
 TRUNC = 2000              # cap raw prompt/response text stored locally
-DROP_ENTRYPOINTS = ("sdk-ts",)   # automation surfaces excluded from the population
+# SDK/automation surfaces excluded from the population — interactive work is cli/ide/
+# web. Matched by PREFIX so every sdk-* variant is dropped (sdk-ts, sdk-cli, …): a
+# real transcript surfaced entrypoint "sdk-cli" (a synthetic, 0-token invocation) that
+# an exact "sdk-ts" match let slip through and pollute the store.
+DROP_ENTRYPOINT_PREFIXES = ("sdk-",)
+SYNTHETIC_MODEL = "<synthetic>"  # a non-LLM synthetic turn — never real interactive work
 RETAIN_DAYS = 14          # raw capture auto-purge age
 CAPTURE_CAP_BYTES = 50 * 1024 * 1024   # ...or total-size cap, whichever hits first
 DEBUG_LOG_MAX_LINES = 500 # bound the opt-in debug log
@@ -1557,6 +1562,13 @@ def _num(x):
         return int(x)
     except (TypeError, ValueError):
         return 0
+
+
+def _dropped_surface(entrypoint):
+    """True for SDK/automation surfaces (any sdk-* entrypoint) — excluded from the
+    interactive-work population."""
+    e = entrypoint or ""
+    return any(e.startswith(p) for p in DROP_ENTRYPOINT_PREFIXES)
 
 
 def _blocks(msg):
@@ -1881,8 +1893,8 @@ def write_fingerprint(payload):
         _debug("SessionStart", sid, "no-session-id")
         return
     surface = payload.get("entrypoint") or "unknown"
-    if surface in DROP_ENTRYPOINTS:
-        _debug("SessionStart", sid, "dropped-sdk")
+    if _dropped_surface(surface):
+        _debug("SessionStart", sid, "dropped-sdk", surface)
         return                       # don't fingerprint automation sessions either
     cwd = payload.get("cwd") or os.getcwd()
     fp = build_fingerprint(sid, cwd, surface)
@@ -1905,9 +1917,12 @@ def rollup(session_id, transcript_path):
         _debug("SessionEnd", session_id, "no-transcript")
         return
     metrics, entrypoint, raw_turns = parse_transcript(transcript_path, _active_task())
-    if entrypoint in DROP_ENTRYPOINTS:
-        _debug("SessionEnd", session_id, "dropped-sdk")
+    if _dropped_surface(entrypoint):
+        _debug("SessionEnd", session_id, "dropped-sdk", entrypoint)
         return                       # automation surface — excluded from the population
+    if metrics.get("model") == SYNTHETIC_MODEL:
+        _debug("SessionEnd", session_id, "dropped-synthetic")
+        return                       # a synthetic (non-LLM) session — not real work
     metrics["session_id"] = session_id
     fp = _read_fingerprint(session_id)   # join the SessionStart setup fingerprint (F7: by stdin id)
     if fp is not None:
